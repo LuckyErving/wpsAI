@@ -25,6 +25,7 @@ var DocSync = (function () {
 
     // ── 本地图片快照（InlineShapes 的 hash 数组，用于检测新增）
     var _lastImageHashes = []
+    var _formatOpsHistory = []  // 最近格式操作历史，用于文本回退覆盖后重放
 
     // ── 简单哈希（djb2），用于快速检测文档内容变化 ────────────
     function _hash(str) {
@@ -143,6 +144,10 @@ var DocSync = (function () {
             var color = Number(value)
             if (isNaN(color)) return { error: '颜色值无效' }
             attrs.color = color
+        } else if (kind === 'name') {
+            var fname = String(value || '').trim()
+            if (!fname) return { error: '字体名不能为空' }
+            attrs.name = fname
         } else {
             return { error: '不支持的格式操作' }
         }
@@ -151,6 +156,26 @@ var DocSync = (function () {
             start: sel.start,
             end: sel.end,
             charAttrs: attrs,
+        }
+    }
+
+    function _recordFormatOp(op) {
+        if (!op) return
+        _formatOpsHistory.push({
+            start: Number(op.start || 0),
+            end: Number(op.end || 0),
+            charAttrs: op.charAttrs || {},
+        })
+        // 控制历史长度，避免内存增长
+        if (_formatOpsHistory.length > 500) {
+            _formatOpsHistory.splice(0, _formatOpsHistory.length - 500)
+        }
+    }
+
+    function _reapplyFormatOps() {
+        if (!_formatOpsHistory.length) return
+        for (var i = 0; i < _formatOpsHistory.length; i++) {
+            _applyFormatOp(_formatOpsHistory[i])
         }
     }
 
@@ -233,6 +258,7 @@ var DocSync = (function () {
     // WPS 支持 Content.XML 时保留格式；否则退回到 Content.Text
     function applyRemoteContent(content) {
         if (!content) return
+        var usedPlainFallback = false
         isApplying = true
         try {
             var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
@@ -252,6 +278,7 @@ var DocSync = (function () {
                 var plain = isXml ? content.replace(/<[^>]+>/g, '') : content
                 var r = doc.Content
                 r.Text = plain
+                usedPlainFallback = true
             }
             // 用实际读回的文本更新哈希，保证后续轮询基准一致
             _lastHash    = _hash(_getText())
@@ -261,6 +288,13 @@ var DocSync = (function () {
         } finally {
             isApplying = false
         }
+
+        if (usedPlainFallback) {
+            // 文本回退会抹掉字符格式，重放最近格式操作。
+            isApplying = true
+            try { _reapplyFormatOps() } finally { isApplying = false }
+        }
+
         // XML 覆盖文档后重新插入本地已知图片
         if (_imageRegistry.length) {
             _reapplyImages()
@@ -452,6 +486,7 @@ var DocSync = (function () {
         _syncedImageIds  = {}
         _imageRegistry   = []
         _lastImageHashes = []
+        _formatOpsHistory = []
         console.log('[Sync] 文档同步已停止')
     }
 
@@ -489,6 +524,7 @@ var DocSync = (function () {
                 if (!_applyFormatOp(op)) {
                     return { ok: false, error: '格式应用失败' }
                 }
+                _recordFormatOp(op)
             } finally {
                 isApplying = false
             }
@@ -501,7 +537,9 @@ var DocSync = (function () {
             if (!msg || !msg.op) return
             isApplying = true
             try {
-                _applyFormatOp(msg.op)
+                if (_applyFormatOp(msg.op)) {
+                    _recordFormatOp(msg.op)
+                }
             } finally {
                 isApplying = false
             }

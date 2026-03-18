@@ -366,6 +366,18 @@
                 <button class="format-btn" onclick="applyFontSize()">设置字号</button>
             </div>
             <div class="format-row">
+                <select id="format-name-select" class="format-select">
+                    <option value="宋体">宋体</option>
+                    <option value="仿宋">仿宋</option>
+                    <option value="黑体">黑体</option>
+                    <option value="楷体">楷体</option>
+                    <option value="微软雅黑">微软雅黑</option>
+                    <option value="Arial">Arial</option>
+                    <option value="Times New Roman">Times New Roman</option>
+                </select>
+                <button class="format-btn" onclick="applyFontName()">设置字体</button>
+            </div>
+            <div class="format-row">
                 <select id="format-color-select" class="format-select">
                     <option value="0">黑色</option>
                     <option value="255">红色</option>
@@ -768,6 +780,13 @@ function applyFontColor() {
     var color = document.getElementById('format-color-select').value
     var res = DocSync.applyLocalFormat('color', color)
     if (!res.ok) setError('format-error', res.error || '颜色设置失败')
+}
+
+function applyFontName() {
+    setError('format-error', '')
+    var name = document.getElementById('format-name-select').value
+    var res = DocSync.applyLocalFormat('name', name)
+    if (!res.ok) setError('format-error', res.error || '字体设置失败')
 }
 
 function onImageFileSelected(input) {
