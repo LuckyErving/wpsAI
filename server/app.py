@@ -3,9 +3,12 @@ import copy
 import json
 import threading
 import time
+import uuid
+import hashlib
 from collections import deque
+from pathlib import Path
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_sock import Sock
 from flask_cors import CORS
 import jwt
@@ -24,6 +27,11 @@ DB_CONFIG = {
     'database': os.environ.get('DB_NAME',     'wps_collab'),
     'charset':  'utf8mb4',
 }
+
+# ── 图片存储配置 ───────────────────────────────────────────────
+IMAGE_DIR        = Path(os.environ.get('IMAGE_DIR', './uploads/images'))
+IMAGE_MAX_BYTES  = 10 * 1024 * 1024          # 10 MB
+IMAGE_ALLOW_EXT  = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff'}
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -92,8 +100,27 @@ def init_db():
                 INDEX idx_doc_id  (doc_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         ''')
+
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS doc_images (
+                id           INT           AUTO_INCREMENT PRIMARY KEY,
+                doc_id       VARCHAR(255)  NOT NULL,
+                file_id      VARCHAR(64)   NOT NULL UNIQUE,
+                filename     VARCHAR(255)  NOT NULL,
+                uploader     VARCHAR(50)   NOT NULL,
+                position     INT           DEFAULT 0,
+                insert_after_para INT      DEFAULT -1,
+                img_width    INT           DEFAULT 0,
+                img_height   INT           DEFAULT 0,
+                created      DATETIME      DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_doc (doc_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        ''')
     conn.commit()
     conn.close()
+
+    # 确保图片存储目录存在
+    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ── JWT ──────────────────────────────────────────────────────
@@ -277,6 +304,40 @@ def _get_current_user():
         return decode_token(token)
     except Exception:
         return None
+
+
+def _allowed_image(filename):
+    return Path(filename).suffix.lower() in IMAGE_ALLOW_EXT
+
+
+def _get_doc_images(doc_id):
+    """从数据库取当前房间所有已同步图片列表。"""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            'SELECT file_id, filename, uploader, position, insert_after_para, '
+            '       img_width, img_height, created '
+            'FROM doc_images WHERE doc_id=%s ORDER BY created ASC',
+            (doc_id,)
+        )
+        rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            'file_id':          r[0],
+            'filename':         r[1],
+            'uploader':         r[2],
+            'position':         r[3],
+            'insert_after_para':r[4],
+            'img_width':        r[5],
+            'img_height':       r[6],
+            'url':              '/api/images/' + r[0],
+        }
+        for r in rows
+    ]
+
+
+def join_room(doc_id, ws, username):
     with rooms_lock:
         if doc_id not in rooms:
             rooms[doc_id] = []
@@ -535,6 +596,113 @@ def get_pending_invites():
         }
         for r in rows
     ]})
+
+
+# ── 图片接口 ──────────────────────────────────────────────────
+@app.route('/api/upload_image', methods=['POST'])
+def upload_image():
+    """
+    上传图片并记录到数据库。
+    Form-data: file=<图片文件>, doc_id=<房间ID>, position=<字符位置>,
+               insert_after_para=<段落索引>, img_width=<宽>, img_height=<高>
+    """
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': '未登录'}), 401
+
+    if 'file' not in request.files:
+        return jsonify({'error': '缺少图片文件'}), 400
+
+    f      = request.files['file']
+    doc_id = (request.form.get('doc_id') or '').strip()
+    if not doc_id:
+        return jsonify({'error': '缺少 doc_id'}), 400
+    if not _allowed_image(f.filename or ''):
+        return jsonify({'error': '不支持的图片格式'}), 400
+
+    raw = f.read()
+    if len(raw) > IMAGE_MAX_BYTES:
+        return jsonify({'error': '图片超过 10MB 限制'}), 413
+
+    # 内容验证：确保是真实图片
+    try:
+        from PIL import Image
+        import io
+        img_obj = Image.open(io.BytesIO(raw))
+        img_w, img_h = img_obj.size
+        img_obj.verify()
+    except Exception:
+        return jsonify({'error': '文件内容不是有效图片'}), 400
+
+    ext     = Path(f.filename).suffix.lower()
+    file_id = uuid.uuid4().hex
+    save_path = IMAGE_DIR / (file_id + ext)
+    with open(save_path, 'wb') as fp:
+        fp.write(raw)
+
+    position         = int(request.form.get('position', 0))
+    insert_after_para = int(request.form.get('insert_after_para', -1))
+    img_width        = int(request.form.get('img_width',  img_w))
+    img_height       = int(request.form.get('img_height', img_h))
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            'INSERT INTO doc_images '
+            '(doc_id, file_id, filename, uploader, position, insert_after_para, img_width, img_height) '
+            'VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
+            (doc_id, file_id, f.filename, user['username'],
+             position, insert_after_para, img_width, img_height)
+        )
+    conn.commit()
+    conn.close()
+
+    img_url = '/api/images/' + file_id
+
+    # 广播给房间内其他成员
+    broadcast(doc_id, {
+        'type':             'insert_image',
+        'file_id':          file_id,
+        'url':              img_url,
+        'filename':         f.filename,
+        'uploader':         user['username'],
+        'position':         position,
+        'insert_after_para':insert_after_para,
+        'img_width':        img_width,
+        'img_height':       img_height,
+    })
+
+    return jsonify({
+        'file_id': file_id,
+        'url':     img_url,
+        'img_width':  img_width,
+        'img_height': img_height,
+    }), 201
+
+
+@app.route('/api/images/<file_id>', methods=['GET'])
+def serve_image(file_id):
+    """异常路径 / 特殊字符验证，防止路径穿越。"""
+    # file_id 只允许 hex 字符
+    if not all(c in '0123456789abcdefABCDEF' for c in file_id):
+        return jsonify({'error': 'invalid id'}), 400
+    # 在目录中搜寻匹配的文件（任意后缀）
+    matched = list(IMAGE_DIR.glob(file_id + '.*'))
+    if not matched:
+        return jsonify({'error': '图片不存在'}), 404
+    target = matched[0]
+    return send_from_directory(str(IMAGE_DIR.resolve()), target.name)
+
+
+@app.route('/api/images/<doc_id>/list', methods=['GET'])
+def list_doc_images(doc_id):
+    """获取文档所有已同步图片列表。"""
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': '未登录'}), 401
+    list_doc_images.__doc__  # noqa
+
+
 @sock.route('/ws')
 def collab_ws(ws):
     """
@@ -585,9 +753,10 @@ def collab_ws(ws):
     users = get_room_users(doc_id)
 
     # 获取当前文档快照（给新成员同步内容）
-    snap = get_snapshot(doc_id)
+    snap   = get_snapshot(doc_id)
+    images = _get_doc_images(doc_id)
 
-    # 欢迎消息（携带快照内容和序列号）
+    # 欢迎消息（携带快照内容、序列号、已同步图片列表）
     ws.send(json.dumps({
         'type':     'welcome',
         'username': username,
@@ -595,6 +764,7 @@ def collab_ws(ws):
         'doc_id':   doc_id,
         'content':  snap['content'],
         'seq':      snap['seq'],
+        'images':   images,
     }, ensure_ascii=False))
 
     # 推送该用户尚未处理的邀请（断线重连 / 首次登录时补发）
@@ -620,16 +790,6 @@ def collab_ws(ws):
             }, ensure_ascii=False))
     except Exception:
         pass
-
-    # 欢迎消息（携带快照内容和序列号）
-    ws.send(json.dumps({
-        'type':     'welcome',
-        'username': username,
-        'users':    users,
-        'doc_id':   doc_id,
-        'content':  snap['content'],
-        'seq':      snap['seq'],
-    }, ensure_ascii=False))
 
     # 通知房间内其他人
     broadcast(doc_id, {

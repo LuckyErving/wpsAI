@@ -270,6 +270,14 @@
         <button class="btn btn-success" onclick="openShareView()" style="margin-bottom:6px">
             &#43; 邀请协作者
         </button>
+        <!-- 图片插入按鈕 + 隐藏文件选择框 -->
+        <button class="btn btn-secondary" onclick="triggerImagePick()" style="margin-bottom:6px">
+            &#128247; 插入/分享图片
+        </button>
+        <input id="img-file-input" type="file"
+               accept="image/jpeg,image/png,image/bmp,image/gif,image/webp"
+               style="display:none" onchange="onImageFileSelected(this)" />
+        <div class="error-msg" id="img-error"></div>
         <button class="btn btn-danger" onclick="leaveCollab()" style="margin-bottom:6px">
             &#10005; 停止协作
         </button>
@@ -468,13 +476,17 @@ function _handleServerMsg(msg) {
             _updateUserList(msg.users, msg.username)
             document.getElementById('online-section').style.display = 'block'
             document.getElementById('btn-join').style.display = 'none'
-            DocSync.initFromSnapshot(msg.content, msg.seq)  // 初始化内容与 seq
+            DocSync.initFromSnapshot(msg.content, msg.seq, msg.images || [])  // 初始化文字+图片
             DocSync.start()
             setStatus('connected', '协作中 · ' + msg.doc_id)
             break
 
         case 'change':
             DocSync.applyRemote(msg.delta, msg.seq)  // 传入 seq 更新本地计数器
+            break
+
+        case 'insert_image':
+            DocSync.applyRemoteImage(msg)
             break
 
         case 'invitation':
@@ -505,6 +517,71 @@ function _updateUserList(users, selfUsername) {
         var label = (u === selfUsername) ? u + '（我）' : u
         return '<span class="' + cls + '">' + label + '</span>'
     }).join('')
+}
+
+// ── 图片上传 ──────────────────────────────
+function triggerImagePick() {
+    document.getElementById('img-file-input').click()
+}
+
+function onImageFileSelected(input) {
+    var file = input.files && input.files[0]
+    if (!file) return
+    input.value = ''  // 允许重复选同一文件
+
+    var docId = document.getElementById('doc-id-input').value.trim()
+    if (!docId) {
+        setError('img-error', '请先加入文档房间')
+        return
+    }
+    setError('img-error', '')
+
+    // 读取文件为 Blob，构建 FormData 上传
+    var reader = new FileReader()
+    reader.onload = function (e) {
+        var blob     = new Blob([e.target.result], { type: file.type })
+        var formData = new FormData()
+        formData.append('file', blob, file.name)
+        formData.append('doc_id', docId)
+        // 获取当前光标位置作为插入点
+        var pos = 0
+        try {
+            var sel = window.Application && window.Application.Selection
+            if (sel) pos = sel.Range.Start
+        } catch (ex) {}
+        formData.append('position', pos)
+
+        var xhr = new XMLHttpRequest()
+        xhr.open('POST', COLLAB_CONFIG.SERVER_HTTP + '/api/upload_image')
+        xhr.setRequestHeader('Authorization', 'Bearer ' + Auth.getToken())
+        xhr.onload = function () {
+            try {
+                var res = JSON.parse(xhr.responseText)
+                if (xhr.status === 201) {
+                    // 在本地文档光标处插入图片
+                    try {
+                        var doc    = window.Application.ActiveDocument
+                        var range  = doc.Range(pos, pos)
+                        var shape  = doc.InlineShapes.AddPicture(
+                            COLLAB_CONFIG.SERVER_HTTP + res.url, false, true, range)
+                        if (res.img_width  > 0) shape.Width  = res.img_width
+                        if (res.img_height > 0) shape.Height = res.img_height
+                    } catch (ex) {
+                        console.warn('[Image] 本地插入失败，图片已上传至服务器', ex)
+                    }
+                    setError('img-error', '')
+                } else {
+                    setError('img-error', res.error || '上传失败')
+                }
+            } catch (ex) {
+                setError('img-error', '响应解析失败')
+            }
+        }
+        xhr.onerror = function () { setError('img-error', '上传网络错误') }
+        xhr.send(formData)
+    }
+    reader.onerror = function () { setError('img-error', '读取文件失败') }
+    reader.readAsArrayBuffer(file)
 }
 
 // ── 停止协作 ──────────────────────────
