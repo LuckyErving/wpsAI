@@ -178,6 +178,21 @@ rooms_lock = threading.Lock()
 doc_snapshots: dict = {}  # {doc_id: {'content': str, 'seq': int}}
 doc_snapshots_lock = threading.Lock()
 
+# 文档路径缓存（记录各房间首个加入者上报的本地文件全路径）
+doc_paths: dict = {}  # {doc_id: str}
+doc_paths_lock = threading.Lock()
+
+
+def get_doc_path(doc_id):
+    with doc_paths_lock:
+        return doc_paths.get(doc_id, '')
+
+
+def set_doc_path(doc_id, path):
+    with doc_paths_lock:
+        if doc_id not in doc_paths and path:
+            doc_paths[doc_id] = path
+
 
 def get_snapshot(doc_id):
     with doc_snapshots_lock:
@@ -596,7 +611,7 @@ def respond_invite(invite_id):
     conn.commit()
     conn.close()
 
-    return jsonify({'ok': True, 'doc_id': row[0]})
+    return jsonify({'ok': True, 'doc_id': row[0], 'doc_path': get_doc_path(row[0])})
 
 
 @app.route('/api/invite/pending', methods=['GET'])
@@ -731,7 +746,8 @@ def list_doc_images(doc_id):
     user = _get_current_user()
     if not user:
         return jsonify({'error': '未登录'}), 401
-    list_doc_images.__doc__  # noqa
+    images = _get_doc_images(doc_id)
+    return jsonify({'images': images})
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +759,7 @@ def _add_notification(receiver: str, ntype: str, content: str):
         db = get_db()
         with db.cursor() as cur:
             cur.execute(
-                'INSERT INTO notifications (receiver, type, content) VALUES (%s, %s, %s)',
+                'INSERT INTO notifications (to_user, ntype, content) VALUES (%s, %s, %s)',
                 (receiver, ntype, content)
             )
             notif_id = cur.lastrowid
@@ -889,9 +905,9 @@ def get_notifications():
         db = get_db()
         with db.cursor() as cur:
             cur.execute('''
-                SELECT id, type, content, is_read, created_at
-                FROM notifications WHERE receiver=%s
-                ORDER BY created_at DESC LIMIT 50
+                SELECT id, ntype, content, is_read, created
+                FROM notifications WHERE to_user=%s
+                ORDER BY created DESC LIMIT 50
             ''', (user['username'],))
             rows = cur.fetchall()
         db.close()
@@ -915,7 +931,7 @@ def mark_notifications_read():
         db = get_db()
         with db.cursor() as cur:
             cur.execute(
-                'UPDATE notifications SET is_read=1 WHERE receiver=%s AND is_read=0',
+                'UPDATE notifications SET is_read=1 WHERE to_user=%s AND is_read=0',
                 (user['username'],)
             )
         db.commit()
@@ -978,7 +994,11 @@ def collab_ws(ws):
     images = _get_doc_images(doc_id)
 
     # 如果内存快照为空，尝试从数据库恢复最新存储（防止服务器重启后内容丢失）
-    if not snap['content']:
+    # 注意：仅当房间里已有其他在线用户时才恢复（说明有进行中的协作会话）。
+    # 若此用户是第一个进入房间的，不从 DB 恢复，由客户端推送当前文档内容作为权威，
+    # 避免历史残留内容覆盖用户正在编辑的文档。
+    other_users_in_room = [u for u in users if u != username]
+    if not snap['content'] and other_users_in_room:
         try:
             _hc2 = get_db()
             with _hc2.cursor() as _cur2:
@@ -1072,6 +1092,11 @@ def collab_ws(ws):
                         'seq':   seq,
                     }, exclude_ws=ws)
 
+                    # 向发送者回送 ack，带上服务器确认的 seq。
+                    # 否则发送者的 _lastSeq 永远为 0，导致每次都对全量历史序列做 OT 变换，
+                    # 位置偏移不断累积，广播给其他客户端的 delta position 越来越大。
+                    ws.send(json.dumps({'type': 'change_ack', 'seq': seq}))
+
             elif msg_type == 'auto_save':
                 # 客户端定期上传文档内容到服务器保存
                 save_content = msg.get('content', '')
@@ -1109,6 +1134,23 @@ def collab_ws(ws):
                     ws.send(json.dumps({'type': 'save_ack', 'ok': True}))
                 except Exception as _e:
                     ws.send(json.dumps({'type': 'save_ack', 'ok': False, 'error': str(_e)}))
+
+            elif msg_type == 'register_path':
+                # 客户端上报当前文档的完整本地路径，供被邀请者打开文档使用
+                path = (msg.get('path') or '').strip()
+                if path:
+                    set_doc_path(doc_id, path)
+
+            elif msg_type == 'get_snapshot':
+                # 客户端主动请求最新快照（用于解决竞态：welcome 为空时延迟重试）
+                _snap  = get_snapshot(doc_id)
+                _imgs  = _get_doc_images(doc_id)
+                ws.send(json.dumps({
+                    'type':    'snapshot',
+                    'content': _snap['content'],
+                    'seq':     _snap['seq'],
+                    'images':  _imgs,
+                }, ensure_ascii=False))
 
             elif msg_type == 'ping':
                 ws.send(json.dumps({'type': 'pong'}))

@@ -12,6 +12,10 @@ var DocSync = (function () {
     var lastSnapshot   = ''
     var isApplying     = false  // 操作锁
     var _lastSeq       = 0      // 最后一次从服务器收到的序列号，发送 change 时带上以支持 OT
+    var _pendingAck    = false  // 等待服务器 change_ack 期间不发送新的 change，
+                                // 防止多条 change 以相同 base_seq 发出被服务器误判为并发操作
+    var _boundDoc      = null   // 绑定到该 taskpane 的文档对象，避免使用 ActiveDocument
+                                // （同一台电脑多窗口测试时 ActiveDocument 会随焦点切换，导致交叉操作）
     var POLL_INTERVAL  = 300    // ms
     var AUTO_SAVE_INTERVAL = 60000  // 60 s
 
@@ -24,7 +28,7 @@ var DocSync = (function () {
     // ── 获取文档纯文本 ─────────────────────────────────────────
     function _getText() {
         try {
-            var doc = window.Application && window.Application.ActiveDocument
+            var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
             if (!doc) return ''
             var text = doc.Content.Text || ''
             // WPS 文档末尾始终有一个段落标记 \r，去掉以便比较
@@ -40,6 +44,8 @@ var DocSync = (function () {
     // ── 获取光标（Selection）所在字符位置 ─────────────────────
     function _getCursorPosition() {
         try {
+            var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
+            if (!doc) return 0
             var sel = window.Application && window.Application.Selection
             return sel ? sel.Range.Start : 0
         } catch (e) { return 0 }
@@ -49,7 +55,7 @@ var DocSync = (function () {
     // 使用图片宽度+高度+段落索引做简单指纹，WPS 无法直接读取图片字节
     function _getImageHashes() {
         try {
-            var doc = window.Application && window.Application.ActiveDocument
+            var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
             if (!doc) return []
             var shapes = doc.InlineShapes
             if (!shapes) return []
@@ -72,7 +78,7 @@ var DocSync = (function () {
     // w/h:      目标宽高（磅，0=自动）
     function _insertImageAt(position, imgUrl, w, h) {
         try {
-            var doc = window.Application && window.Application.ActiveDocument
+            var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
             if (!doc) return false
             var range  = doc.Range(position, position)
             var shapes = doc.InlineShapes
@@ -123,7 +129,7 @@ var DocSync = (function () {
     // ── 将 delta 应用到 WPS 文档 ──────────────────────────────
     function _applyDelta(delta) {
         try {
-            var doc = window.Application && window.Application.ActiveDocument
+            var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
             if (!doc) return
 
             // 计算删除范围终点（加上末尾 \r 偏移）
@@ -150,11 +156,14 @@ var DocSync = (function () {
     // ── 轮询：检查并同步 ──────────────────────────────────────
     function _checkAndSync() {
         if (isApplying) return  // 正在应用远程变更，跳过本轮
+        if (_pendingAck) return // 等待上一条 change 的 ack，暂不发送
+                                // lastSnapshot 不更新，累积差异留到 ack 后一次性发出
         var current = _getText()
         if (current !== lastSnapshot) {
             var delta = _computeDelta(lastSnapshot, current)
             lastSnapshot = current
             if (delta.deleteCount !== 0 || delta.insert !== '') {
+                _pendingAck = true
                 WSManager.send({ type: 'change', delta: delta, base_seq: _lastSeq })
             }
         }
@@ -164,12 +173,18 @@ var DocSync = (function () {
     // ── 接收并应用远程 delta ──────────────────────────────────
     function applyRemote(delta, seq) {
         if (!delta) return
-        if (seq !== undefined && seq !== null) _lastSeq = seq
+        // 用 max 防止 ack 乱序时覆盖更高的 seq
+        if (seq !== undefined && seq !== null) _lastSeq = Math.max(_lastSeq, seq)
         isApplying = true
+        // 确定性地计算新快照，不再依赖 WPS API 读回
+        // 避免 WPS 异步渲染导致读回时机过早，形成误报「本地变更」回响
+        var pos    = Math.max(0, delta.position || 0)
+        var dc     = Math.max(0, delta.deleteCount || 0)
+        var ins    = delta.insert || ''
+        var newSnap = lastSnapshot.slice(0, pos) + ins + lastSnapshot.slice(pos + dc)
         try {
             _applyDelta(delta)
-            // 更新快照，避免轮询误判为本地变更
-            lastSnapshot = _getText()
+            lastSnapshot = newSnap
         } finally {
             isApplying = false
         }
@@ -190,7 +205,7 @@ var DocSync = (function () {
         }
         isApplying = true
         try {
-            var doc = window.Application && window.Application.ActiveDocument
+            var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
             if (doc) {
                 // 使用 doc.Content 范围覆盖全部正文（包含图片占位符），
                 // 直接赋值可避免图片字符偏移错误。
@@ -304,14 +319,15 @@ var DocSync = (function () {
     }
 
     // ── 开始同步 ──────────────────────────────────────────────
-    function start() {
+    function start(docObj) {
+        _boundDoc        = docObj || (window.Application && window.Application.ActiveDocument) || null
         lastSnapshot     = _getText()
         _lastImageHashes = _getImageHashes()
         if (pollingTimer)  clearInterval(pollingTimer)
         if (autoSaveTimer) clearInterval(autoSaveTimer)
         pollingTimer  = setInterval(_checkAndSync, POLL_INTERVAL)
         autoSaveTimer = setInterval(_doAutoSave,   AUTO_SAVE_INTERVAL)
-        console.log('[Sync] 文档同步已启动（含自动保存 60s）')
+        console.log('[Sync] 文档同步已启动，绑定文档:', _boundDoc ? (_boundDoc.Name || 'ok') : 'ActiveDocument')
     }
 
     // ── 停止同步 ──────────────────────────────────────────────
@@ -320,6 +336,8 @@ var DocSync = (function () {
         if (autoSaveTimer) { clearInterval(autoSaveTimer); autoSaveTimer = null }
         lastSnapshot     = ''
         isApplying       = false
+        _pendingAck      = false
+        _boundDoc        = null
         _syncedImageIds  = {}
         _lastImageHashes = []
         console.log('[Sync] 文档同步已停止')
@@ -338,5 +356,12 @@ var DocSync = (function () {
         uploadLocalImage:     uploadLocalImage,
         pushInitialContent:   pushInitialContent,
         isRunning:            isRunning,
+        getLocalText:         _getText,
+        updateSeq:            function(seq) {
+            // ack 到达：更新 seq（取 max 防止乱序降级），清除挂起锁，立即检测累积变更
+            if (seq !== undefined && seq !== null) _lastSeq = Math.max(_lastSeq, seq)
+            _pendingAck = false
+            _checkAndSync()  // 立即发送等待期间累积的变更，无需等下一个 300ms 周期
+        },
     }
 })()

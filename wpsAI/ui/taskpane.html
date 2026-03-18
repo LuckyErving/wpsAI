@@ -561,6 +561,11 @@ function joinCollab() {
     setStatus('idle', '连接中...')
     document.getElementById('btn-join').disabled = true
 
+    // 加入时绑定当前激活文档，后续所有读写都针对此文档，
+    // 避免多窗口共享 JS 运行时时 ActiveDocument 随焦点切换导致交叉操作
+    var _joinDoc = null
+    try { _joinDoc = window.Application && window.Application.ActiveDocument } catch (e) {}
+
     WSManager.connect(token, docId, {
         onOpen: function () {
             setStatus('connected', '已连接')
@@ -569,30 +574,55 @@ function joinCollab() {
             setStatus('disconnected', '连接断开，重连中...')
         },
         onMessage: function (msg) {
-            _handleServerMsg(msg)
+            _handleServerMsg(msg, _joinDoc)
         },
     })
+
+    // 加入后上报当前文档的完整路径，供其他被邀请者打开文档使用
+    try {
+        var fullPath = _joinDoc ? _joinDoc.FullName : ''
+        if (fullPath) {
+            // WS 可能还未 open，稍等连接成功后再发
+            var _pathTimer = setInterval(function () {
+                if (WSManager.connected()) {
+                    WSManager.send({ type: 'register_path', path: fullPath })
+                    clearInterval(_pathTimer)
+                }
+            }, 200)
+        }
+    } catch (e) {}
 }
 
 // ── 处理服务器消息 ─────────────────────
-function _handleServerMsg(msg) {
+function _handleServerMsg(msg, boundDoc) {
     switch (msg.type) {
         case 'welcome':
             _updateUserList(msg.users, msg.username)
             document.getElementById('online-section').style.display = 'block'
             document.getElementById('btn-join').style.display = 'none'
             DocSync.initFromSnapshot(msg.content, msg.seq, msg.images || [])  // 初始化文字+图片
-            DocSync.start()
+            DocSync.start(boundDoc)
             // 若服务器没有该文档的内容快照（首次建房或重启后），
             // 立即把本地文档全文推送给服务器作为初始种子。
             // 这样后续 delta 才能被正确地应用在完整文本上，
             // 晚加入的成员也能收到完整的文档内容。
             if (!msg.content) {
                 DocSync.pushInitialContent()
+                // 竞态保护：延迟 1.5s 后再向服务器请求一次最新快照，
+                // 防止本客户端在另一成员 pushInitialContent 尚未被服务器处理前就连上，
+                // 导致收到空 welcome 后看不到已有内容。
+                setTimeout(function() { WSManager.send({ type: 'get_snapshot' }) }, 1500)
             }
             setStatus('connected', '协作中 · ' + msg.doc_id)
             // 加入后刷新通知徽标
             _refreshNotifBadge()
+            break
+
+        case 'change_ack':
+            // 服务器确认我方发出的 change 已处理，更新 _lastSeq。
+            // 否则 _lastSeq 永远为 0，每次发送的 base_seq 都是 0，
+            // 导致服务器对全量历史做 OT 变换，位置偏移不断累积产生乱蹦字。
+            DocSync.updateSeq(msg.seq)
             break
 
         case 'change':
@@ -612,6 +642,15 @@ function _handleServerMsg(msg) {
         case 'notification':
             // 服务器主动推送的通知（非邀请类）
             _refreshNotifBadge()
+            break
+
+        case 'snapshot':
+            // 服务器响应 get_snapshot 请求，仅在本地文档为空时才用服务器内容初始化。
+            // 此消息只在竞态场景下发送（welcome 为空时延迟 1.5s 拉取），
+            // 若本地已有内容说明是房间创建者，不应被覆盖。
+            if (msg.content && !DocSync.getLocalText()) {
+                DocSync.initFromSnapshot(msg.content, msg.seq, msg.images || [])
+            }
             break
 
         case 'save_ack':
@@ -882,7 +921,7 @@ function respondCurrentInvite(action) {
     .then(function (res) { return res.json() })
     .then(function (data) {
         if (action === 'accept' && data.ok) {
-            _joinByDocId(data.doc_id)
+            _joinByDocId(data.doc_id, data.doc_path || '')
         }
         // 处理下一个邀请（如果有）
         setTimeout(_showNextInvite, 300)
@@ -890,14 +929,53 @@ function respondCurrentInvite(action) {
     .catch(function () { setTimeout(_showNextInvite, 300) })
 }
 
-function _joinByDocId(docId) {
-    // 如果已在另一个房间，先退出
+function _joinByDocId(docId, docPath) {
+    // 先退出当前协作房间（若有）
     if (DocSync.isRunning()) leaveCollab()
     showView('view-collab')
-    setTimeout(function () {
+
+    function _doJoin() {
         document.getElementById('doc-id-input').value = docId
         joinCollab()
-    }, 200)
+    }
+
+    // 若服务器返回了文档完整路径，先打开/激活该文档再加入协作
+    if (docPath) {
+        try {
+            var app  = window.Application
+            var docs = app && app.Documents
+            var targetDoc = null
+
+            // 检查文档是否已经打开
+            if (docs) {
+                for (var i = 1; i <= docs.Count; i++) {
+                    try {
+                        if (docs.Item(i).FullName === docPath) {
+                            targetDoc = docs.Item(i)
+                            break
+                        }
+                    } catch (e) {}
+                }
+            }
+
+            if (!targetDoc && docs) {
+                // 文档未打开，新标签页打开
+                targetDoc = docs.Open(docPath)
+            }
+
+            // 激活对应窗口，使 ActiveDocument 切换过来
+            if (targetDoc) {
+                try { targetDoc.Activate() } catch (e) {}
+            }
+
+            // 等待文档激活后再加入协作
+            setTimeout(_doJoin, 800)
+            return
+        } catch (e) {
+            console.warn('[Invite] 打开文档失败，直接加入协作', e)
+        }
+    }
+    setTimeout(_doJoin, 200)
 }
 
 // -- 轮询未处理邀请（用户尚未加入任何房间时的容错率）———
