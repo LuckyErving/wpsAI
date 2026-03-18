@@ -176,6 +176,60 @@
         .modal-body { font-size: 13px; color: #444; line-height: 1.7; margin-bottom: 14px; }
         .modal-actions { display: flex; gap: 8px; }
         .modal-actions .btn { flex: 1; }
+
+        /* -- 通知徽标 ---------------------- */
+        .notif-badge {
+            position: absolute;
+            top: -4px; right: -4px;
+            background: #ea4335;
+            color: #fff;
+            font-size: 10px;
+            font-weight: bold;
+            border-radius: 10px;
+            min-width: 16px;
+            height: 16px;
+            line-height: 16px;
+            text-align: center;
+            padding: 0 4px;
+            display: none;
+        }
+        .btn-icon-wrap { position: relative; display: inline-block; width: 100%; }
+
+        /* -- 历史/通知列表 ---------------------- */
+        .list-card {
+            background: #fff;
+            border: 1px solid #e8eaed;
+            border-radius: 6px;
+            margin-bottom: 6px;
+            padding: 10px 12px;
+            cursor: pointer;
+            transition: box-shadow .12s;
+        }
+        .list-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,.12); }
+        .list-card .card-title { font-size: 13px; font-weight: bold; color: #1a73e8; }
+        .list-card .card-meta  { font-size: 11px; color: #999; margin-top: 2px; }
+        .notif-card { cursor: default; }
+        .notif-card.unread { border-left: 3px solid #1a73e8; }
+        .notif-card .notif-content { font-size: 13px; color: #333; }
+        .notif-card .notif-time { font-size: 11px; color: #999; margin-top: 2px; }
+        .scroll-area { max-height: 340px; overflow-y: auto; }
+        .hist-snap-item {
+            padding: 6px 10px;
+            border-bottom: 1px solid #f0f0f0;
+            display: flex; justify-content: space-between; align-items: center;
+            font-size: 12px;
+        }
+        .hist-snap-item:last-child { border-bottom: none; }
+        .restore-btn {
+            padding: 3px 10px;
+            border: 1px solid #1a73e8;
+            border-radius: 4px;
+            background: #fff;
+            color: #1a73e8;
+            cursor: pointer;
+            font-size: 11px;
+        }
+        .restore-btn:hover { background: #e8f0fe; }
     </style>
 </head>
 
@@ -270,6 +324,15 @@
         <button class="btn btn-success" onclick="openShareView()" style="margin-bottom:6px">
             &#43; 邀请协作者
         </button>
+        <div style="display:flex;gap:6px;margin-bottom:6px">
+            <div class="btn-icon-wrap" style="flex:1">
+                <button class="btn btn-secondary" style="width:100%" onclick="openHistoryView()">&#128196; 历史文档</button>
+            </div>
+            <div class="btn-icon-wrap" style="flex:1">
+                <button class="btn btn-secondary" style="width:100%" onclick="openNotifView()">&#128276; 通知</button>
+                <span id="notif-badge" class="notif-badge"></span>
+            </div>
+        </div>
         <!-- 图片插入按鈕 + 隐藏文件选择框 -->
         <button class="btn btn-secondary" onclick="triggerImagePick()" style="margin-bottom:6px">
             &#128247; 插入/分享图片
@@ -311,6 +374,48 @@
         <button class="btn btn-primary" onclick="sendInvite()">&#128232; 发送邀请</button>
         <button class="btn btn-secondary" onclick="showView('view-collab')">取消</button>
     </div>
+</div>
+
+
+<!-- ═══════════════════════
+     视图 5：历史文档
+═══════════════════════ -->
+<div id="view-history" class="view">
+    <div class="title">&#128196; 历史协作文档</div>
+
+    <div id="hist-doc-list" class="scroll-area">
+        <div style="color:#999;font-size:12px;padding:20px 0;text-align:center">加载中…</div>
+    </div>
+
+    <!-- 单个文档的快照列表（折叠面板） -->
+    <div id="hist-snap-panel" style="display:none">
+        <div style="display:flex;align-items:center;gap:8px;margin:10px 0 6px">
+            <button class="link-btn" onclick="_showHistDocList()" style="padding:0">&#8592; 返回</button>
+            <span style="font-size:13px;font-weight:bold" id="hist-panel-title"></span>
+        </div>
+        <div id="hist-snap-list" class="scroll-area"></div>
+    </div>
+
+    <div class="error-msg" id="hist-error"></div>
+    <button class="btn btn-secondary" style="margin-top:8px" onclick="showView('view-collab')">返回协同面板</button>
+</div>
+
+
+<!-- ═══════════════════════
+     视图 6：通知列表
+═══════════════════════ -->
+<div id="view-notifications" class="view">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <div class="title" style="margin-bottom:0;border:none">&#128276; 通知</div>
+        <button class="link-btn" onclick="markAllRead()" style="padding:0">全部已读</button>
+    </div>
+
+    <div id="notif-list" class="scroll-area">
+        <div style="color:#999;font-size:12px;padding:20px 0;text-align:center">加载中…</div>
+    </div>
+
+    <div class="error-msg" id="notif-error"></div>
+    <button class="btn btn-secondary" style="margin-top:8px" onclick="showView('view-collab')">返回协同面板</button>
 </div>
 
 
@@ -478,7 +583,16 @@ function _handleServerMsg(msg) {
             document.getElementById('btn-join').style.display = 'none'
             DocSync.initFromSnapshot(msg.content, msg.seq, msg.images || [])  // 初始化文字+图片
             DocSync.start()
+            // 若服务器没有该文档的内容快照（首次建房或重启后），
+            // 立即把本地文档全文推送给服务器作为初始种子。
+            // 这样后续 delta 才能被正确地应用在完整文本上，
+            // 晚加入的成员也能收到完整的文档内容。
+            if (!msg.content) {
+                DocSync.pushInitialContent()
+            }
             setStatus('connected', '协作中 · ' + msg.doc_id)
+            // 加入后刷新通知徽标
+            _refreshNotifBadge()
             break
 
         case 'change':
@@ -491,6 +605,21 @@ function _handleServerMsg(msg) {
 
         case 'invitation':
             _queueInvitation(msg)
+            // 同时更新通知徽标
+            _refreshNotifBadge()
+            break
+
+        case 'notification':
+            // 服务器主动推送的通知（非邀请类）
+            _refreshNotifBadge()
+            break
+
+        case 'save_ack':
+            if (msg.ok) {
+                console.log('[AutoSave] 自动保存成功')
+            } else {
+                console.warn('[AutoSave] 自动保存失败:', msg.error)
+            }
             break
 
         case 'user_join':
@@ -602,7 +731,10 @@ window.onload = function () {
             Auth.getRealname() || Auth.getUsername()
         _prefillDocId()
         showView('view-collab')
-        _startInvitePolling()  // 登录状态下开启轮询容错率
+        _startInvitePolling()   // 登录状态下开启轮询容错率
+        _refreshNotifBadge()    // 初始化通知徽标
+        // 每 30s 刷新一次通知徽标（即使不在协作中）
+        setInterval(_refreshNotifBadge, 30000)
     } else {
         showView('view-login')
     }
@@ -787,6 +919,167 @@ function _startInvitePolling() {
 
 function _stopInvitePolling() {
     if (_invitePolling) { clearInterval(_invitePolling); _invitePolling = null }
+}
+
+// ─────────────────────────────────────────────
+//  历史文档功能
+// ─────────────────────────────────────────────
+function openHistoryView() {
+    showView('view-history')
+    _showHistDocList()
+}
+
+function _showHistDocList() {
+    document.getElementById('hist-snap-panel').style.display = 'none'
+    var listEl = document.getElementById('hist-doc-list')
+    listEl.style.display = 'block'
+    listEl.innerHTML = '<div style="color:#999;font-size:12px;padding:20px 0;text-align:center">加载中…</div>'
+    setError('hist-error', '')
+
+    fetch(COLLAB_CONFIG.SERVER_HTTP + '/api/doc/history/all', {
+        headers: { 'Authorization': 'Bearer ' + Auth.getToken() }
+    })
+    .then(function (r) { return r.json() })
+    .then(function (data) {
+        if (!data.length) {
+            listEl.innerHTML = '<div style="color:#999;font-size:12px;padding:20px 0;text-align:center">暂无历史协作记录</div>'
+            return
+        }
+        listEl.innerHTML = data.map(function (d) {
+            var ts = d.last_saved ? d.last_saved.replace('T', ' ').slice(0, 16) : ''
+            return '<div class="list-card" onclick="_showHistSnaps(\'' + d.doc_id.replace(/'/g,"\\'") + '\')">'  
+                + '<div class="card-title">&#128196; ' + _esc(d.doc_id) + '</div>'
+                + '<div class="card-meta">最后保存：' + ts + '</div>'
+                + '</div>'
+        }).join('')
+    })
+    .catch(function () { setError('hist-error', '加载失败，请重试') })
+}
+
+function _showHistSnaps(docId) {
+    document.getElementById('hist-doc-list').style.display = 'none'
+    var panel = document.getElementById('hist-snap-panel')
+    var snapList = document.getElementById('hist-snap-list')
+    document.getElementById('hist-panel-title').textContent = docId
+    panel.style.display = 'block'
+    snapList.innerHTML = '<div style="color:#999;font-size:12px;padding:10px 0;text-align:center">加载中…</div>'
+
+    fetch(COLLAB_CONFIG.SERVER_HTTP + '/api/doc/history/' + encodeURIComponent(docId), {
+        headers: { 'Authorization': 'Bearer ' + Auth.getToken() }
+    })
+    .then(function (r) { return r.json() })
+    .then(function (data) {
+        if (!data.length) {
+            snapList.innerHTML = '<div style="color:#999;font-size:12px;padding:10px 0;text-align:center">暂无保存记录</div>'
+            return
+        }
+        snapList.innerHTML = data.map(function (s) {
+            var ts = (s.saved_at || '').replace('T', ' ').slice(0, 16)
+            return '<div class="hist-snap-item">'
+                + '<span>' + _esc(s.saver) + ' &nbsp; <span style="color:#bbb">' + ts + '</span></span>'
+                + '<button class="restore-btn" onclick="_restoreHistEntry(' + s.id + ')">恢复</button>'
+                + '</div>'
+        }).join('')
+    })
+    .catch(function () { setError('hist-error', '加载失败，请重试') })
+}
+
+function _restoreHistEntry(histId) {
+    if (!confirm('确定要将当前文档恢复到该历史版本吗？当前内容将被替换。')) return
+    fetch(COLLAB_CONFIG.SERVER_HTTP + '/api/doc/history/entry/' + histId, {
+        headers: { 'Authorization': 'Bearer ' + Auth.getToken() }
+    })
+    .then(function (r) { return r.json() })
+    .then(function (data) {
+        if (!data.content) { setError('hist-error', '该记录无内容'); return }
+        DocSync.initFromSnapshot(data.content, null, [])
+        alert('已恢复历史版本（' + (data.saved_at || '').slice(0, 16) + '）')
+        showView('view-collab')
+    })
+    .catch(function () { setError('hist-error', '恢复失败，请重试') })
+}
+
+// ─────────────────────────────────────────────
+//  通知功能
+// ─────────────────────────────────────────────
+function openNotifView() {
+    showView('view-notifications')
+    loadNotifications()
+}
+
+function loadNotifications() {
+    var listEl = document.getElementById('notif-list')
+    listEl.innerHTML = '<div style="color:#999;font-size:12px;padding:20px 0;text-align:center">加载中…</div>'
+    setError('notif-error', '')
+
+    fetch(COLLAB_CONFIG.SERVER_HTTP + '/api/notifications', {
+        headers: { 'Authorization': 'Bearer ' + Auth.getToken() }
+    })
+    .then(function (r) { return r.json() })
+    .then(function (data) {
+        if (!data.length) {
+            listEl.innerHTML = '<div style="color:#999;font-size:12px;padding:20px 0;text-align:center">暂无通知</div>'
+            return
+        }
+        listEl.innerHTML = data.map(function (n) {
+            var ts  = (n.created_at || '').replace('T', ' ').slice(0, 16)
+            var cls = 'list-card notif-card' + (n.is_read ? '' : ' unread')
+            return '<div class="' + cls + '">'
+                + '<div class="notif-content">' + _esc(n.content) + '</div>'
+                + '<div class="notif-time">' + ts + '</div>'
+                + '</div>'
+        }).join('')
+        // 更新徽标
+        _updateNotifBadge(data.filter(function (n) { return !n.is_read }).length)
+    })
+    .catch(function () { setError('notif-error', '加载失败，请重试') })
+}
+
+function markAllRead() {
+    fetch(COLLAB_CONFIG.SERVER_HTTP + '/api/notifications/read', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + Auth.getToken() }
+    })
+    .then(function (r) { return r.json() })
+    .then(function () {
+        _updateNotifBadge(0)
+        loadNotifications()
+    })
+    .catch(function () {})
+}
+
+function _updateNotifBadge(count) {
+    var badge = document.getElementById('notif-badge')
+    if (!badge) return
+    if (count > 0) {
+        badge.textContent = count > 99 ? '99+' : count
+        badge.style.display = 'block'
+    } else {
+        badge.style.display = 'none'
+    }
+}
+
+function _refreshNotifBadge() {
+    if (!Auth.isLoggedIn()) return
+    fetch(COLLAB_CONFIG.SERVER_HTTP + '/api/notifications', {
+        headers: { 'Authorization': 'Bearer ' + Auth.getToken() }
+    })
+    .then(function (r) { return r.json() })
+    .then(function (data) {
+        var unread = data.filter(function (n) { return !n.is_read }).length
+        _updateNotifBadge(unread)
+    })
+    .catch(function () {})
+}
+
+// 转义 HTML 特殊字符（防止 XSS）
+function _esc(s) {
+    if (!s) return ''
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
 }
 </script>
 

@@ -116,6 +116,32 @@ def init_db():
                 INDEX idx_doc (doc_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         ''')
+
+        # 文档历史快照（自动保存）
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS doc_history (
+                id         INT           AUTO_INCREMENT PRIMARY KEY,
+                doc_id     VARCHAR(255)  NOT NULL,
+                saver      VARCHAR(50)   NOT NULL,
+                content    MEDIUMTEXT    NOT NULL,
+                saved_at   DATETIME      DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_doc_time (doc_id, saved_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        ''')
+
+        # 用户通知（邀请/加入/離开等）
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS notifications (
+                id         INT           AUTO_INCREMENT PRIMARY KEY,
+                to_user    VARCHAR(50)   NOT NULL,
+                ntype      VARCHAR(30)   NOT NULL,
+                content    VARCHAR(512)  NOT NULL,
+                extra      VARCHAR(512)  DEFAULT '',
+                is_read    TINYINT(1)    DEFAULT 0,
+                created    DATETIME      DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_user_read (to_user, is_read)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        ''')
     conn.commit()
     conn.close()
 
@@ -525,6 +551,11 @@ def create_invite():
                 'from_user':     user['username'],
                 'from_realname': from_realname,
             })
+            # 同时写入通知表（离线时也能看到）
+            _add_notification(
+                to_user, 'invitation',
+                f'{from_realname} 邀请你协作文档「{doc_id}」'
+            )
         except Exception:
             conn.rollback()
     conn.close()
@@ -703,6 +734,197 @@ def list_doc_images(doc_id):
     list_doc_images.__doc__  # noqa
 
 
+# ---------------------------------------------------------------------------
+# 通知辅助函数
+# ---------------------------------------------------------------------------
+def _add_notification(receiver: str, ntype: str, content: str):
+    """向指定用户写入一条通知，并通过 WebSocket 实时推送。"""
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                'INSERT INTO notifications (receiver, type, content) VALUES (%s, %s, %s)',
+                (receiver, ntype, content)
+            )
+            notif_id = cur.lastrowid
+        db.commit()
+        db.close()
+        push_to_user(receiver, {
+            'type':    'notification',
+            'id':      notif_id,
+            'ntype':   ntype,
+            'content': content,
+        })
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# 文档历史 API
+# ---------------------------------------------------------------------------
+@app.route('/api/doc/save', methods=['POST'])
+def save_doc_history():
+    """手动保存当前文档快照到历史记录。"""
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': '未登录'}), 401
+    data    = request.get_json(force=True, silent=True) or {}
+    doc_id  = data.get('doc_id', '').strip()
+    content = data.get('content', '')
+    if not doc_id:
+        return jsonify({'error': '缺少 doc_id'}), 400
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                'INSERT INTO doc_history (doc_id, saver, content) VALUES (%s, %s, %s)',
+                (doc_id, user['username'], content)
+            )
+            cur.execute('''
+                DELETE FROM doc_history WHERE doc_id=%s
+                AND id NOT IN (
+                    SELECT id FROM (
+                        SELECT id FROM doc_history
+                        WHERE doc_id=%s ORDER BY saved_at DESC LIMIT 50
+                    ) AS t
+                )
+            ''', (doc_id, doc_id))
+        db.commit()
+        db.close()
+        # 同步更新内存快照
+        if content:
+            with doc_snapshots_lock:
+                s = doc_snapshots.get(doc_id, {'content': '', 'seq': 0})
+                doc_snapshots[doc_id] = {'content': content, 'seq': s['seq']}
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/doc/history/all', methods=['GET'])
+def list_all_doc_history():
+    """列出当前用户参与过的所有文档（去重）及其最新保存时间。"""
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': '未登录'}), 401
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute('''
+                SELECT doc_id, MAX(saved_at) AS last_saved
+                FROM doc_history
+                WHERE saver=%s
+                GROUP BY doc_id
+                ORDER BY last_saved DESC
+                LIMIT 100
+            ''', (user['username'],))
+            rows = cur.fetchall()
+        db.close()
+        result = [{'doc_id': r[0], 'last_saved': str(r[1])} for r in rows]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/doc/history/<doc_id>', methods=['GET'])
+def list_doc_history(doc_id):
+    """列出指定文档的历史保存列表（最新50条）。"""
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': '未登录'}), 401
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute('''
+                SELECT id, saver, saved_at
+                FROM doc_history WHERE doc_id=%s
+                ORDER BY saved_at DESC LIMIT 50
+            ''', (doc_id,))
+            rows = cur.fetchall()
+        db.close()
+        result = [{'id': r[0], 'saver': r[1], 'saved_at': str(r[2])} for r in rows]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/doc/history/entry/<int:hist_id>', methods=['GET'])
+def get_doc_history_entry(hist_id):
+    """获取某条历史记录的完整内容（用于恢复）。"""
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': '未登录'}), 401
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                'SELECT doc_id, saver, content, saved_at FROM doc_history WHERE id=%s',
+                (hist_id,)
+            )
+            row = cur.fetchone()
+        db.close()
+        if not row:
+            return jsonify({'error': '记录不存在'}), 404
+        return jsonify({
+            'id':       hist_id,
+            'doc_id':   row[0],
+            'saver':    row[1],
+            'content':  row[2],
+            'saved_at': str(row[3]),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# 通知 API
+# ---------------------------------------------------------------------------
+@app.route('/api/notifications', methods=['GET'])
+def get_notifications():
+    """获取当前用户的通知列表（最新50条）。"""
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': '未登录'}), 401
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute('''
+                SELECT id, type, content, is_read, created_at
+                FROM notifications WHERE receiver=%s
+                ORDER BY created_at DESC LIMIT 50
+            ''', (user['username'],))
+            rows = cur.fetchall()
+        db.close()
+        result = [
+            {'id': r[0], 'type': r[1], 'content': r[2],
+             'is_read': bool(r[3]), 'created_at': str(r[4])}
+            for r in rows
+        ]
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/notifications/read', methods=['POST'])
+def mark_notifications_read():
+    """将当前用户的所有未读通知标记为已读。"""
+    user = _get_current_user()
+    if not user:
+        return jsonify({'error': '未登录'}), 401
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                'UPDATE notifications SET is_read=1 WHERE receiver=%s AND is_read=0',
+                (user['username'],)
+            )
+        db.commit()
+        db.close()
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @sock.route('/ws')
 def collab_ws(ws):
     """
@@ -752,9 +974,26 @@ def collab_ws(ws):
     add_user_connection(username, ws)
     users = get_room_users(doc_id)
 
-    # 获取当前文档快照（给新成员同步内容）
     snap   = get_snapshot(doc_id)
     images = _get_doc_images(doc_id)
+
+    # 如果内存快照为空，尝试从数据库恢复最新存储（防止服务器重启后内容丢失）
+    if not snap['content']:
+        try:
+            _hc2 = get_db()
+            with _hc2.cursor() as _cur2:
+                _cur2.execute(
+                    'SELECT content FROM doc_history WHERE doc_id=%s ORDER BY saved_at DESC LIMIT 1',
+                    (doc_id,)
+                )
+                _db_row = _cur2.fetchone()
+            _hc2.close()
+            if _db_row and _db_row[0]:
+                with doc_snapshots_lock:
+                    doc_snapshots[doc_id] = {'content': _db_row[0], 'seq': snap['seq']}
+                snap = get_snapshot(doc_id)
+        except Exception:
+            pass
 
     # 欢迎消息（携带快照内容、序列号、已同步图片列表）
     ws.send(json.dumps({
@@ -832,6 +1071,44 @@ def collab_ws(ws):
                         'from':  username,
                         'seq':   seq,
                     }, exclude_ws=ws)
+
+            elif msg_type == 'auto_save':
+                # 客户端定期上传文档内容到服务器保存
+                save_content = msg.get('content', '')
+                if save_content:
+                    # ① 无论 DB 是否成功，先更新内存快照（这是最关键的一步）
+                    #    确保首次入房时服务器能立即持有完整文档，后续 delta 才能
+                    #    正确应用，以及后来者能拿到完整内容。
+                    with doc_snapshots_lock:
+                        _s = doc_snapshots.get(doc_id, {'content': '', 'seq': 0})
+                        doc_snapshots[doc_id] = {'content': save_content, 'seq': _s['seq']}
+                # ② 异步写入数据库（含 55 秒/人的节流，不影响内存已更新的快照）
+                try:
+                    _sc = get_db()
+                    with _sc.cursor() as _scur:
+                        _scur.execute('''
+                            INSERT INTO doc_history (doc_id, saver, content)
+                            SELECT %s, %s, %s FROM DUAL
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM doc_history
+                                WHERE doc_id=%s AND saver=%s
+                                  AND saved_at > DATE_SUB(NOW(), INTERVAL 55 SECOND)
+                            ) LIMIT 1
+                        ''', (doc_id, username, save_content, doc_id, username))
+                        _scur.execute('''
+                            DELETE FROM doc_history WHERE doc_id=%s
+                            AND id NOT IN (
+                                SELECT id FROM (
+                                    SELECT id FROM doc_history
+                                    WHERE doc_id=%s ORDER BY saved_at DESC LIMIT 50
+                                ) AS t
+                            )
+                        ''', (doc_id, doc_id))
+                    _sc.commit()
+                    _sc.close()
+                    ws.send(json.dumps({'type': 'save_ack', 'ok': True}))
+                except Exception as _e:
+                    ws.send(json.dumps({'type': 'save_ack', 'ok': False, 'error': str(_e)}))
 
             elif msg_type == 'ping':
                 ws.send(json.dumps({'type': 'pong'}))

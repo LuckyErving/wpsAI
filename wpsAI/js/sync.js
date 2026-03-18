@@ -7,11 +7,13 @@
  * - 操作锁防止"回响"（远程写入触发本地变更误报）
  */
 var DocSync = (function () {
-    var pollingTimer  = null
-    var lastSnapshot  = ''
-    var isApplying    = false  // 操作锁
-    var _lastSeq      = 0      // 最后一次从服务器收到的序列号，发送 change 时带上以支持 OT
-    var POLL_INTERVAL = 300    // ms
+    var pollingTimer   = null
+    var autoSaveTimer  = null
+    var lastSnapshot   = ''
+    var isApplying     = false  // 操作锁
+    var _lastSeq       = 0      // 最后一次从服务器收到的序列号，发送 change 时带上以支持 OT
+    var POLL_INTERVAL  = 300    // ms
+    var AUTO_SAVE_INTERVAL = 60000  // 60 s
 
     // ── 已同步图片集合（file_id set，防止重复插入）────────────
     var _syncedImageIds = {}  // {file_id: true}
@@ -178,7 +180,6 @@ var DocSync = (function () {
         // seq 必须先更新，即使内容为空也要记录
         if (seq !== undefined && seq !== null) _lastSeq = seq
         if (content === undefined || content === null) {
-            // 即使没有文字内容也要处理图片
             _applyImageList(images)
             return
         }
@@ -189,15 +190,16 @@ var DocSync = (function () {
         }
         isApplying = true
         try {
-            var currentText = _getText()
-            if (currentText !== content) {
-                var doc = window.Application && window.Application.ActiveDocument
-                if (doc) {
-                    var range = doc.Range(0, currentText.length)
-                    range.Text = content
-                }
+            var doc = window.Application && window.Application.ActiveDocument
+            if (doc) {
+                // 使用 doc.Content 范围覆盖全部正文（包含图片占位符），
+                // 直接赋值可避免图片字符偏移错误。
+                // WPS 会保留尾部段落标记，所以不必手动加 \r。
+                var contentRange = doc.Content
+                contentRange.Text = content
             }
-            lastSnapshot = content
+            // 重新读取，确保 lastSnapshot 与实际文档状态一致
+            lastSnapshot = _getText()
             console.log('[Sync] 已从服务器初始化文字内容，seq=' + seq + '，长度:' + content.length)
         } catch (e) {
             console.error('[Sync] 初始化快照失败', e)
@@ -284,21 +286,38 @@ var DocSync = (function () {
         })
     }
 
+    // ── 自动保存（定期向服务器发送当前文档内容）──────────────
+    function _doAutoSave() {
+        var content = _getText()
+        if (!content) return
+        WSManager.send({ type: 'auto_save', content: content })
+    }
+
+    // ── 主动推送当前文档内容，用于首次加入时种子化服务器快照 ────
+    // 当 welcome.content 为空（服务器无记录）时，由外部调用以确保
+    // 服务器拿到正确的初始全文，避免后续 delta 被应用到空字符串上。
+    function pushInitialContent() {
+        var content = _getText()
+        if (!content) return
+        console.log('[Sync] 服务器无内容快照，推送本地文档内容作为初始种子，长度:', content.length)
+        WSManager.send({ type: 'auto_save', content: content })
+    }
+
     // ── 开始同步 ──────────────────────────────────────────────
     function start() {
         lastSnapshot     = _getText()
         _lastImageHashes = _getImageHashes()
-        if (pollingTimer) clearInterval(pollingTimer)
-        pollingTimer = setInterval(_checkAndSync, POLL_INTERVAL)
-        console.log('[Sync] 文档同步已启动')
+        if (pollingTimer)  clearInterval(pollingTimer)
+        if (autoSaveTimer) clearInterval(autoSaveTimer)
+        pollingTimer  = setInterval(_checkAndSync, POLL_INTERVAL)
+        autoSaveTimer = setInterval(_doAutoSave,   AUTO_SAVE_INTERVAL)
+        console.log('[Sync] 文档同步已启动（含自动保存 60s）')
     }
 
     // ── 停止同步 ──────────────────────────────────────────────
     function stop() {
-        if (pollingTimer) {
-            clearInterval(pollingTimer)
-            pollingTimer = null
-        }
+        if (pollingTimer)  { clearInterval(pollingTimer);  pollingTimer  = null }
+        if (autoSaveTimer) { clearInterval(autoSaveTimer); autoSaveTimer = null }
         lastSnapshot     = ''
         isApplying       = false
         _syncedImageIds  = {}
@@ -311,12 +330,13 @@ var DocSync = (function () {
     }
 
     return {
-        start:            start,
-        stop:             stop,
-        applyRemote:      applyRemote,
-        applyRemoteImage: applyRemoteImage,
-        initFromSnapshot: initFromSnapshot,
-        uploadLocalImage: uploadLocalImage,
-        isRunning:        isRunning,
+        start:                start,
+        stop:                 stop,
+        applyRemote:          applyRemote,
+        applyRemoteImage:     applyRemoteImage,
+        initFromSnapshot:     initFromSnapshot,
+        uploadLocalImage:     uploadLocalImage,
+        pushInitialContent:   pushInitialContent,
+        isRunning:            isRunning,
     }
 })()
