@@ -1,7 +1,19 @@
 <customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="OnAddinLoad">
     <ribbon startFromScratch="false">
         <tabs>
-            <tab id="wpsAddinTab" label="wps加载项示例">
+            <!-- 协同编辑 Tab -->
+            <tab id="collabTab" label="协同编辑">
+                <group id="collabMainGroup" label="协作">
+                    <button id="btnOpenCollab"
+                            label="协同面板"
+                            onAction="OnAction"
+                            getImage="GetImage"
+                            size="large" />
+                </group>
+            </tab>
+
+            <!-- 原示例 Tab（保留） -->
+            <tab id="wpsAddinTab" label="插件示例">
 				<group id="btnDemoGroup" label="group1">
                     <button id="btnShowMsg" label="弹出消息框" onAction="OnAction" getEnabled="OnGetEnabled"  getImage="GetImage" visible="true" size="large"/>
                     <button id="btnIsEnbable" getLabel="OnGetLabel" onAction="OnAction" enabled="true"  getImage="GetImage" visible="true" size="large"/>

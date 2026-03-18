@@ -18,6 +18,18 @@ var WebNotifycount = 0;
 function OnAction(control) {
     const eleId = control.Id
     switch (eleId) {
+        case "btnOpenCollab": {
+            let tsId = window.Application.PluginStorage.getItem("collab_taskpane_id")
+            if (!tsId) {
+                let tskpane = window.Application.CreateTaskPane(GetUrlPath() + "/ui/taskpane.html")
+                window.Application.PluginStorage.setItem("collab_taskpane_id", tskpane.ID)
+                tskpane.Visible = true
+            } else {
+                let tskpane = window.Application.GetTaskPane(tsId)
+                tskpane.Visible = !tskpane.Visible
+            }
+            break
+        }
         case "btnShowMsg":
             {
                 const doc = window.Application.ActiveDocument
@@ -88,6 +100,8 @@ function OnAction(control) {
 function GetImage(control) {
     const eleId = control.Id
     switch (eleId) {
+        case "btnOpenCollab":
+            return "images/3.svg"
         case "btnShowMsg":
             return "images/1.svg"
         case "btnShowDialog":

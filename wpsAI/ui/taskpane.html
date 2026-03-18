@@ -1,50 +1,441 @@
 <!DOCTYPE html>
-<html>
-
+<html lang="zh">
 <head>
-    <meta charset="utf-8">
+    <meta charset="UTF-8">
+    <title>协同编辑</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+            font-size: 13px;
+            background: #f5f6fa;
+            color: #333;
+        }
+
+        /* ── 视图切换 ─────────────────────────── */
+        .view { display: none; padding: 16px; }
+        .view.active { display: block; }
+
+        /* ── 通用组件 ─────────────────────────── */
+        .title {
+            font-size: 15px;
+            font-weight: bold;
+            color: #1a73e8;
+            margin-bottom: 14px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #1a73e8;
+        }
+
+        .form-group { margin-bottom: 10px; }
+        .form-group label {
+            display: block;
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 3px;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 7px 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 13px;
+            outline: none;
+            transition: border .2s;
+        }
+        .form-group input:focus { border-color: #1a73e8; }
+
+        .btn {
+            width: 100%;
+            padding: 8px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: bold;
+            margin-top: 4px;
+            transition: opacity .15s;
+        }
+        .btn:hover  { opacity: .88; }
+        .btn:active { opacity: .75; }
+        .btn-primary   { background: #1a73e8; color: #fff; }
+        .btn-success   { background: #34a853; color: #fff; }
+        .btn-danger    { background: #ea4335; color: #fff; }
+        .btn-secondary { background: #e8eaed; color: #444; }
+
+        .link-btn {
+            background: none;
+            border: none;
+            color: #1a73e8;
+            cursor: pointer;
+            font-size: 12px;
+            padding: 6px 0;
+            text-decoration: underline;
+        }
+        .link-center { text-align: center; margin-top: 8px; }
+
+        .error-msg {
+            color: #ea4335;
+            font-size: 12px;
+            margin-top: 6px;
+            min-height: 16px;
+        }
+
+        /* ── 状态栏 ──────────────────────────── */
+        .status-bar {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 8px 10px;
+            border-radius: 6px;
+            font-size: 12px;
+            margin-bottom: 12px;
+        }
+        .status-bar .dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .status-bar.connected    { background: #e6f4ea; color: #137333; }
+        .status-bar.connected .dot    { background: #34a853; }
+        .status-bar.disconnected { background: #fce8e6; color: #c5221f; }
+        .status-bar.disconnected .dot { background: #ea4335; }
+        .status-bar.idle         { background: #e8f0fe; color: #1558bc; }
+        .status-bar.idle .dot    { background: #1a73e8; }
+
+        /* ── 用户列表 ─────────────────────────── */
+        .section-label {
+            font-size: 11px;
+            color: #999;
+            text-transform: uppercase;
+            letter-spacing: .5px;
+            margin: 10px 0 5px;
+        }
+        .user-list { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px; }
+        .user-chip {
+            background: #e8f0fe;
+            color: #1558bc;
+            padding: 3px 9px;
+            border-radius: 12px;
+            font-size: 12px;
+        }
+        .user-chip.self { background: #e6f4ea; color: #137333; }
+
+        /* ── 文档ID输入row ────────────────────── */
+        .doc-row { display: flex; gap: 6px; margin-bottom: 10px; }
+        .doc-row input {
+            flex: 1;
+            padding: 7px 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 13px;
+            outline: none;
+        }
+        .doc-row input:focus { border-color: #1a73e8; }
+        .doc-row .btn { width: auto; padding: 7px 14px; margin-top: 0; }
+
+        hr { border: none; border-top: 1px solid #e8eaed; margin: 12px 0; }
+    </style>
 </head>
-<script type="text/javascript" src="../js/util.js"></script>
-<script type="text/javascript" src="../js/taskpane.js"></script>
-<script type="text/javascript" src="../.debugTemp/wpsjsrpcsdk.js"></script>
 
 <body>
-    <div class="global">
-        <div class="divItem">
-            这是一个网页，按<span style="font-weight: bolder;">"F12"</span>可以打开调试器。
-        </div>
-        <div class="divItem">
-            这个示例展示了wps加载项的相关基础能力，与B/S业务系统的交互，请用浏览器打开：
-            <span style="font-weight: bolder;color: slateblue;cursor:pointer" id="DemoSpan"
-                onclick="shellExecuteByOAAssist(this.innerHTML)"></span>
-        </div>
-        <div class="divItem">开发文档: <span style="font-weight: bolder;color: slateblue;cursor:pointer"
-                onclick="shellExecuteByOAAssist(this.innerHTML)">https://open.wps.cn/docs/office</span></div>
-        <hr>
-        <div class="divItem">
-            <button style="margin:3px;" onclick="onbuttonclick('dockLeft')">停靠左边</button>
-            <button style="margin:3px;" onclick="onbuttonclick('dockRight')">停靠右边</button>
-            <button style="margin:3px;" onclick="onbuttonclick('hideTaskPane')">隐藏TaskPane</button>
-            <button style="margin:3px;" onclick="onbuttonclick('addString')">文档开头添加字符串</button>
-            <button style="margin:3px;" onclick="onbuttonclick('getDocName')">取文件名</button>
-        </div>
-        <hr>
-        <div class="divItem">文档文件名为：<span id="text_p"></span></div>
+
+<!-- ═══════════════════════
+     视图 1：登录
+═══════════════════════ -->
+<div id="view-login" class="view active">
+    <div class="title">🔐 登录协同系统</div>
+
+    <div class="form-group">
+        <label>用户名</label>
+        <input id="login-username" type="text" placeholder="请输入用户名" />
     </div>
+    <div class="form-group">
+        <label>密码</label>
+        <input id="login-password" type="password" placeholder="请输入密码" />
+    </div>
+
+    <div class="error-msg" id="login-error"></div>
+
+    <button class="btn btn-primary" onclick="doLogin()">登 录</button>
+    <div class="link-center">
+        <button class="link-btn" onclick="showView('view-register')">还没有账号？立即注册</button>
+    </div>
+</div>
+
+
+<!-- ═══════════════════════
+     视图 2：注册
+═══════════════════════ -->
+<div id="view-register" class="view">
+    <div class="title">📝 注册新账号</div>
+
+    <div class="form-group">
+        <label>用户名 <span style="color:#999;font-size:11px">（2-30字符）</span></label>
+        <input id="reg-username" type="text" placeholder="设置用户名" />
+    </div>
+    <div class="form-group">
+        <label>真实姓名 <span style="color:#999;font-size:11px">（可选）</span></label>
+        <input id="reg-realname" type="text" placeholder="如：张三" />
+    </div>
+    <div class="form-group">
+        <label>密码 <span style="color:#999;font-size:11px">（至少6位）</span></label>
+        <input id="reg-password" type="password" placeholder="设置密码" />
+    </div>
+    <div class="form-group">
+        <label>确认密码</label>
+        <input id="reg-password2" type="password" placeholder="再次输入密码" />
+    </div>
+
+    <div class="error-msg" id="reg-error"></div>
+
+    <button class="btn btn-success" onclick="doRegister()">注 册</button>
+    <div class="link-center">
+        <button class="link-btn" onclick="showView('view-login')">已有账号？返回登录</button>
+    </div>
+</div>
+
+
+<!-- ═══════════════════════
+     视图 3：协同面板
+═══════════════════════ -->
+<div id="view-collab" class="view">
+
+    <div id="status-bar" class="status-bar idle">
+        <span class="dot"></span>
+        <span id="status-text">空闲</span>
+    </div>
+
+    <div style="font-size:13px;margin-bottom:10px;">
+        当前用户：<strong id="collab-username"></strong>
+    </div>
+
+    <hr>
+
+    <div class="section-label">文档房间</div>
+    <div class="doc-row">
+        <input id="doc-id-input" type="text" placeholder="输入文档名作为房间号" />
+        <button class="btn btn-primary" id="btn-join" onclick="joinCollab()">加入</button>
+    </div>
+    <div class="error-msg" id="collab-error"></div>
+
+    <div id="online-section" style="display:none">
+        <div class="section-label">在线协作者</div>
+        <div class="user-list" id="user-list"></div>
+        <button class="btn btn-danger" onclick="leaveCollab()" style="margin-bottom:6px">
+            ✕ 停止协作
+        </button>
+    </div>
+
+    <hr>
+    <button class="btn btn-secondary" onclick="doLogout()">退出登录</button>
+</div>
+
+
+<!-- ═══════════════════════
+     脚本引入
+═══════════════════════ -->
+<script type="text/javascript" src="../js/util.js"></script>
+<script type="text/javascript" src="../js/config.js"></script>
+<script type="text/javascript" src="../js/ws-manager.js"></script>
+<script type="text/javascript" src="../js/auth.js"></script>
+<script type="text/javascript" src="../js/sync.js"></script>
+<script>
+// 兼容 dev 调试模式动态注入 SDK
+(function () {
+    var s = document.createElement('script')
+    s.src = '../.debugTemp/wpsjsrpcsdk.js'
+    s.onerror = function () { /* WPS 内部运行时由 WPS 注入，此处忽略 */ }
+    document.head.appendChild(s)
+})()
+</script>
+
+<script>
+// ═══════════════════════════════════════
+//  页面逻辑
+// ═══════════════════════════════════════
+
+function showView(viewId) {
+    document.querySelectorAll('.view').forEach(function (v) {
+        v.classList.remove('active')
+    })
+    document.getElementById(viewId).classList.add('active')
+}
+
+function setError(elemId, msg) {
+    document.getElementById(elemId).textContent = msg || ''
+}
+
+function setStatus(type, text) {
+    var bar = document.getElementById('status-bar')
+    bar.className = 'status-bar ' + type
+    document.getElementById('status-text').textContent = text
+}
+
+// ── 登录 ──────────────────────────────
+function doLogin() {
+    var username = document.getElementById('login-username').value.trim()
+    var password = document.getElementById('login-password').value
+    setError('login-error', '')
+
+    if (!username || !password) {
+        setError('login-error', '请填写用户名和密码')
+        return
+    }
+
+    Auth.login(username, password).then(function (res) {
+        if (res.ok) {
+            document.getElementById('collab-username').textContent =
+                res.data.realname || res.data.username
+            _prefillDocId()
+            showView('view-collab')
+        } else {
+            setError('login-error', res.error)
+        }
+    })
+}
+
+// ── 注册 ──────────────────────────────
+function doRegister() {
+    var username  = document.getElementById('reg-username').value.trim()
+    var realname  = document.getElementById('reg-realname').value.trim()
+    var password  = document.getElementById('reg-password').value
+    var password2 = document.getElementById('reg-password2').value
+    setError('reg-error', '')
+
+    if (!username || !password) {
+        setError('reg-error', '请填写用户名和密码')
+        return
+    }
+    if (password !== password2) {
+        setError('reg-error', '两次密码不一致')
+        return
+    }
+
+    Auth.register(username, password, realname).then(function (res) {
+        if (res.ok) {
+            alert('注册成功！请登录。')
+            document.getElementById('login-username').value = username
+            showView('view-login')
+        } else {
+            setError('reg-error', res.error)
+        }
+    })
+}
+
+// ── 登出 ──────────────────────────────
+function doLogout() {
+    leaveCollab()
+    Auth.clearSession()
+    document.getElementById('login-password').value = ''
+    showView('view-login')
+}
+
+// ── 预填文档名 ────────────────────────
+function _prefillDocId() {
+    try {
+        var doc = window.Application && window.Application.ActiveDocument
+        if (doc && doc.Name) {
+            document.getElementById('doc-id-input').value = doc.Name
+        }
+    } catch (e) {}
+}
+
+// ── 加入协作 ──────────────────────────
+function joinCollab() {
+    setError('collab-error', '')
+    var docId = document.getElementById('doc-id-input').value.trim()
+    if (!docId) {
+        setError('collab-error', '请输入文档 ID / 房间名')
+        return
+    }
+    var token = Auth.getToken()
+    if (!token) {
+        setError('collab-error', 'Token 已失效，请重新登录')
+        doLogout()
+        return
+    }
+
+    setStatus('idle', '连接中...')
+    document.getElementById('btn-join').disabled = true
+
+    WSManager.connect(token, docId, {
+        onOpen: function () {
+            setStatus('connected', '已连接')
+        },
+        onClose: function () {
+            setStatus('disconnected', '连接断开，重连中...')
+        },
+        onMessage: function (msg) {
+            _handleServerMsg(msg)
+        },
+    })
+}
+
+// ── 处理服务器消息 ─────────────────────
+function _handleServerMsg(msg) {
+    switch (msg.type) {
+        case 'welcome':
+            _updateUserList(msg.users, msg.username)
+            document.getElementById('online-section').style.display = 'block'
+            document.getElementById('btn-join').style.display = 'none'
+            DocSync.start()
+            setStatus('connected', '协作中 · ' + msg.doc_id)
+            break
+
+        case 'change':
+            DocSync.applyRemote(msg.delta)
+            break
+
+        case 'user_join':
+        case 'user_leave':
+            _updateUserList(msg.users, Auth.getUsername())
+            break
+
+        case 'error':
+            setError('collab-error', msg.message)
+            setStatus('disconnected', '错误：' + msg.message)
+            document.getElementById('btn-join').disabled = false
+            break
+
+        case 'pong':
+            break
+    }
+}
+
+// ── 更新在线用户列表 ──────────────────
+function _updateUserList(users, selfUsername) {
+    var list = document.getElementById('user-list')
+    list.innerHTML = (users || []).map(function (u) {
+        var cls   = (u === selfUsername) ? 'user-chip self' : 'user-chip'
+        var label = (u === selfUsername) ? u + '（我）' : u
+        return '<span class="' + cls + '">' + label + '</span>'
+    }).join('')
+}
+
+// ── 停止协作 ──────────────────────────
+function leaveCollab() {
+    DocSync.stop()
+    WSManager.disconnect()
+    setStatus('idle', '空闲')
+    document.getElementById('online-section').style.display = 'none'
+    document.getElementById('btn-join').style.display = ''
+    document.getElementById('btn-join').disabled = false
+    document.getElementById('user-list').innerHTML = ''
+}
+
+// ── 初始化 ────────────────────────────
+window.onload = function () {
+    if (Auth.isLoggedIn()) {
+        document.getElementById('collab-username').textContent =
+            Auth.getRealname() || Auth.getUsername()
+        _prefillDocId()
+        showView('view-collab')
+    } else {
+        showView('view-login')
+    }
+}
+</script>
+
 </body>
-
-<style>
-    .global {
-        font-size: 15px;
-        min-height: 95%;
-    }
-
-    .divItem {
-        margin-left: 5px;
-        margin-bottom: 18px;
-        font-size: 15px;
-        word-wrap: break-word;
-    }
-</style>
-
 </html>
