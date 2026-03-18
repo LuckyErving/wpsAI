@@ -20,13 +20,23 @@ function OnAction(control) {
     switch (eleId) {
         case "btnOpenCollab": {
             let tsId = window.Application.PluginStorage.getItem("collab_taskpane_id")
-            if (!tsId) {
+            let opened = false
+            if (tsId) {
+                try {
+                    let tskpane = window.Application.GetTaskPane(tsId)
+                    if (tskpane) {
+                        tskpane.Visible = !tskpane.Visible
+                        opened = true
+                    }
+                } catch (e) {
+                    // 旧 ID 失效（WPS 重启 / 加载项重载），清除后重建
+                    window.Application.PluginStorage.setItem("collab_taskpane_id", null)
+                }
+            }
+            if (!opened) {
                 let tskpane = window.Application.CreateTaskPane(GetUrlPath() + "/ui/taskpane.html")
                 window.Application.PluginStorage.setItem("collab_taskpane_id", tskpane.ID)
                 tskpane.Visible = true
-            } else {
-                let tskpane = window.Application.GetTaskPane(tsId)
-                tskpane.Visible = !tskpane.Visible
             }
             break
         }
