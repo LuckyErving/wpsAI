@@ -9,29 +9,60 @@
 var DocSync = (function () {
     var pollingTimer   = null
     var autoSaveTimer  = null
-    var lastSnapshot   = ''
-    var isApplying     = false  // 操作锁
-    var _lastSeq       = 0      // 最后一次从服务器收到的序列号，发送 change 时带上以支持 OT
-    var _pendingAck    = false  // 等待服务器 change_ack 期间不发送新的 change，
-                                // 防止多条 change 以相同 base_seq 发出被服务器误判为并发操作
-    var _boundDoc      = null   // 绑定到该 taskpane 的文档对象，避免使用 ActiveDocument
-                                // （同一台电脑多窗口测试时 ActiveDocument 会随焦点切换，导致交叉操作）
-    var POLL_INTERVAL  = 300    // ms
+    var _lastContent   = ''     // 上一次已同步的文档 XML 内容（含格式）
+    var _lastHash      = 0      // _lastContent 的哈希，用于快速变更检测
+    var isApplying     = false  // 操作锁，防止应用远程内容时触发本地变更检测
+    var _pendingAck    = false  // 等待服务器 content_ack，期间暂不发送新更新
+    var _boundDoc      = null   // 绑定的文档对象，避免 ActiveDocument 随焦点切换
+    var POLL_INTERVAL  = 500    // ms（XML 较大，适当降低轮询频率）
     var AUTO_SAVE_INTERVAL = 60000  // 60 s
 
     // ── 已同步图片集合（file_id set，防止重复插入）────────────
     var _syncedImageIds = {}  // {file_id: true}
 
+    // ── 已知图片注册表，在 applyRemoteContent 覆盖文档后重新插入
+    var _imageRegistry = []   // [{file_id, url, position, img_width, img_height}]
+
     // ── 本地图片快照（InlineShapes 的 hash 数组，用于检测新增）
     var _lastImageHashes = []
 
-    // ── 获取文档纯文本 ─────────────────────────────────────────
+    // ── 简单哈希（djb2），用于快速检测文档内容变化 ────────────
+    function _hash(str) {
+        var h = 5381
+        for (var i = 0; i < str.length; i++) {
+            h = ((h << 5) + h) + str.charCodeAt(i)
+            h = h & h
+        }
+        return h
+    }
+
+    // ── 剥离 XML 中的图片元素（drawing/pict）────────────────────
+    // XML 同步只负责文字和格式；图片通过独立的 insert_image 机制同步
+    function _stripDrawings(xml) {
+        if (!xml) return xml
+        return xml
+            .replace(/<w:drawing\b[^>]*>[\s\S]*?<\/w:drawing>/g, '')
+            .replace(/<w:pict\b[^>]*>[\s\S]*?<\/w:pict>/g, '')
+    }
+
+    // ── 获取文档 XML 内容（含格式信息）────────────────────────
+    // 若 WPS 不支持 Content.XML 则返回 ''
+    function _getContent() {
+        try {
+            var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
+            if (!doc) return ''
+            var xml = doc.Content.XML
+            if (typeof xml !== 'string' || xml === '') return ''
+            return xml
+        } catch (e) { return '' }
+    }
+
+    // ── 获取文档纯文本（仅用于判断文档是否为空）────────────────
     function _getText() {
         try {
             var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
             if (!doc) return ''
             var text = doc.Content.Text || ''
-            // WPS 文档末尾始终有一个段落标记 \r，去掉以便比较
             if (text.length > 0 && text.charAt(text.length - 1) === '\r') {
                 text = text.slice(0, -1)
             }
@@ -105,101 +136,72 @@ var DocSync = (function () {
         console.log('[Sync] 本地图片数量变化，当前:', current.length)
     }
 
-    // ── 计算最小 delta（前缀/后缀裁剪算法）────────────────────
-    function _computeDelta(oldText, newText) {
-        var s = 0
-        while (s < oldText.length && s < newText.length &&
-               oldText.charAt(s) === newText.charAt(s)) {
-            s++
+    // ── 轮询：检测文字变化并同步（含格式，剥离图片）──────────
+    // 用 Content.Text 做变更检测（可靠），用 Content.XML 做载荷（含格式）
+    // 若 Content.XML 不可用则直接发纯文本，确保在所有 WPS 版本下都能同步
+    function _checkAndSync() {
+        if (isApplying || _pendingAck) return
+        var text = _getText()
+        var h    = _hash(text)
+        if (h !== _lastHash) {
+            _lastHash    = h
+            _lastContent = text
+            _pendingAck  = true
+            var xml = _getContent()               // 尝试取 XML（含格式）
+            var stripped = xml ? _stripDrawings(xml) : ''
+            WSManager.send({
+                type: 'content_update',
+                xml:  stripped || text,           // XML 优先，不可用时退化为纯文本
+            })
         }
-        var oldEnd = oldText.length
-        var newEnd = newText.length
-        while (oldEnd > s && newEnd > s &&
-               oldText.charAt(oldEnd - 1) === newText.charAt(newEnd - 1)) {
-            oldEnd--
-            newEnd--
-        }
-        return {
-            position:    s,
-            deleteCount: oldEnd - s,
-            insert:      newText.slice(s, newEnd),
-        }
+        // 图片变更由 insert_image 机制单独处理，不在此轮询
     }
 
-    // ── 将 delta 应用到 WPS 文档 ──────────────────────────────
-    function _applyDelta(delta) {
+    // ── 接收并应用远程内容（可能是 XML 或纯文本）───────────────
+    // WPS 支持 Content.XML 时保留格式；否则退回到 Content.Text
+    function applyRemoteContent(content) {
+        if (!content) return
+        isApplying = true
         try {
             var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
             if (!doc) return
-
-            // 计算删除范围终点（加上末尾 \r 偏移）
-            var rangeEnd = delta.position + delta.deleteCount
-            var range = doc.Range(delta.position, rangeEnd)
-
-            if (delta.insert) {
-                range.Text = delta.insert
-            } else {
-                range.Delete()
+            var isXml = content.charAt(0) === '<'  // 粗判断：XML 以 '<' 开头
+            var applied = false
+            if (isXml) {
+                try {
+                    doc.Content.XML = content
+                    applied = true
+                } catch (e) {
+                    console.warn('[Sync] Content.XML 设置失败，退回纯文本', e)
+                }
             }
-
-            // 触发 WPS 重绘（WPS 已知的必要 workaround）
-            try {
-                var sel = window.Application.Selection.Range
-                if (sel) sel.Select()
-            } catch (e) {}
-
+            if (!applied) {
+                // 退回：去掉所有 XML 标签只保留文本
+                var plain = isXml ? content.replace(/<[^>]+>/g, '') : content
+                var r = doc.Content
+                r.Text = plain
+            }
+            // 用实际读回的文本更新哈希，保证后续轮询基准一致
+            _lastHash    = _hash(_getText())
+            _lastContent = content
         } catch (e) {
-            console.error('[Sync] 应用 delta 失败', e)
-        }
-    }
-
-    // ── 轮询：检查并同步 ──────────────────────────────────────
-    function _checkAndSync() {
-        if (isApplying) return  // 正在应用远程变更，跳过本轮
-        if (_pendingAck) return // 等待上一条 change 的 ack，暂不发送
-                                // lastSnapshot 不更新，累积差异留到 ack 后一次性发出
-        var current = _getText()
-        if (current !== lastSnapshot) {
-            var delta = _computeDelta(lastSnapshot, current)
-            lastSnapshot = current
-            if (delta.deleteCount !== 0 || delta.insert !== '') {
-                _pendingAck = true
-                WSManager.send({ type: 'change', delta: delta, base_seq: _lastSeq })
-            }
-        }
-        _checkImages()
-    }
-
-    // ── 接收并应用远程 delta ──────────────────────────────────
-    function applyRemote(delta, seq) {
-        if (!delta) return
-        // 用 max 防止 ack 乱序时覆盖更高的 seq
-        if (seq !== undefined && seq !== null) _lastSeq = Math.max(_lastSeq, seq)
-        isApplying = true
-        // 确定性地计算新快照，不再依赖 WPS API 读回
-        // 避免 WPS 异步渲染导致读回时机过早，形成误报「本地变更」回响
-        var pos    = Math.max(0, delta.position || 0)
-        var dc     = Math.max(0, delta.deleteCount || 0)
-        var ins    = delta.insert || ''
-        var newSnap = lastSnapshot.slice(0, pos) + ins + lastSnapshot.slice(pos + dc)
-        try {
-            _applyDelta(delta)
-            lastSnapshot = newSnap
+            console.error('[Sync] 应用远程内容失败', e)
         } finally {
             isApplying = false
         }
+        // XML 覆盖文档后重新插入本地已知图片
+        if (_imageRegistry.length) {
+            _reapplyImages()
+            // 图片插入会改变文档，需重新同步哈希基准
+            _lastHash = _hash(_getText())
+        }
     }
 
-    // ── 用服务器快照初始化本地文档 ──────────────────────
+    // ── 用服务器快照初始化本地文档（含格式，XML 或纯文本）──────
     function initFromSnapshot(content, seq, images) {
-        // seq 必须先更新，即使内容为空也要记录
-        if (seq !== undefined && seq !== null) _lastSeq = seq
-        if (content === undefined || content === null) {
-            _applyImageList(images)
-            return
-        }
-        if (content === '') {
-            lastSnapshot = ''
+        if (!content) {
+            _lastContent = ''
+            _lastHash    = _hash('')
             _applyImageList(images)
             return
         }
@@ -207,21 +209,42 @@ var DocSync = (function () {
         try {
             var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
             if (doc) {
-                // 使用 doc.Content 范围覆盖全部正文（包含图片占位符），
-                // 直接赋值可避免图片字符偏移错误。
-                // WPS 会保留尾部段落标记，所以不必手动加 \r。
-                var contentRange = doc.Content
-                contentRange.Text = content
+                var isXml   = content.charAt(0) === '<'
+                var applied = false
+                if (isXml) {
+                    try { doc.Content.XML = content; applied = true } catch (e) {}
+                }
+                if (!applied) {
+                    var plain = isXml ? content.replace(/<[^>]+>/g, '') : content
+                    doc.Content.Text = plain
+                }
             }
-            // 重新读取，确保 lastSnapshot 与实际文档状态一致
-            lastSnapshot = _getText()
-            console.log('[Sync] 已从服务器初始化文字内容，seq=' + seq + '，长度:' + content.length)
+            _lastContent = content
+            _lastHash    = _hash(_getText())  // 始终基于实际文本哈希
+            console.log('[Sync] 已从服务器初始化文档，长度:', content.length)
         } catch (e) {
             console.error('[Sync] 初始化快照失败', e)
         } finally {
             isApplying = false
         }
         _applyImageList(images)
+    }
+
+    // ── 重新插入注册表中所有已知图片（XML 同步覆盖文档后恢复）────
+    function _reapplyImages() {
+        isApplying = true
+        try {
+            for (var i = 0; i < _imageRegistry.length; i++) {
+                var img     = _imageRegistry[i]
+                var fullUrl = img.url.indexOf('http') === 0
+                    ? img.url
+                    : COLLAB_CONFIG.SERVER_HTTP + img.url
+                _insertImageAt(img.position, fullUrl, img.img_width, img.img_height)
+            }
+            _lastImageHashes = _getImageHashes()
+        } finally {
+            isApplying = false
+        }
     }
 
     // ── 批量应用服务器图片列表（新成员加入时）──────────────────
@@ -231,6 +254,13 @@ var DocSync = (function () {
             var img = images[i]
             if (_syncedImageIds[img.file_id]) continue
             _syncedImageIds[img.file_id] = true
+            _imageRegistry.push({
+                file_id:    img.file_id,
+                url:        img.url,
+                position:   img.position,
+                img_width:  img.img_width,
+                img_height: img.img_height,
+            })
             var fullUrl = COLLAB_CONFIG.SERVER_HTTP + img.url
             _insertImageAt(img.position, fullUrl, img.img_width, img.img_height)
         }
@@ -242,6 +272,13 @@ var DocSync = (function () {
         if (!msg || !msg.file_id) return
         if (_syncedImageIds[msg.file_id]) return
         _syncedImageIds[msg.file_id] = true
+        _imageRegistry.push({
+            file_id:    msg.file_id,
+            url:        msg.url,
+            position:   msg.position,
+            img_width:  msg.img_width,
+            img_height: msg.img_height,
+        })
         isApplying = true
         try {
             var fullUrl = COLLAB_CONFIG.SERVER_HTTP + msg.url
@@ -301,44 +338,47 @@ var DocSync = (function () {
         })
     }
 
-    // ── 自动保存（定期向服务器发送当前文档内容）──────────────
+    // ── 自动保存（定期向服务器发送当前文档 XML 内容，剥离图片）──
     function _doAutoSave() {
-        var content = _getText()
-        if (!content) return
-        WSManager.send({ type: 'auto_save', content: content })
+        var xml = _stripDrawings(_getContent())  // 服务器快照只含文字+格式
+        if (!xml) return
+        WSManager.send({ type: 'auto_save', content: xml })
     }
 
-    // ── 主动推送当前文档内容，用于首次加入时种子化服务器快照 ────
-    // 当 welcome.content 为空（服务器无记录）时，由外部调用以确保
-    // 服务器拿到正确的初始全文，避免后续 delta 被应用到空字符串上。
+    // ── 首次加入时推送本地文档 XML 作为服务器初始快照 ────────────
     function pushInitialContent() {
-        var content = _getText()
-        if (!content) return
-        console.log('[Sync] 服务器无内容快照，推送本地文档内容作为初始种子，长度:', content.length)
-        WSManager.send({ type: 'auto_save', content: content })
+        var xml = _stripDrawings(_getContent())  // 同上，剥离图片
+        if (!xml) return
+        console.log('[Sync] 推送本地文档 XML 作为初始快照，长度:', xml.length)
+        WSManager.send({ type: 'auto_save', content: xml })
     }
 
     // ── 开始同步 ──────────────────────────────────────────────
     function start(docObj) {
+        _pendingAck      = false   // 重置：防止重连时旧 ack 未到导致永久卡死
         _boundDoc        = docObj || (window.Application && window.Application.ActiveDocument) || null
-        lastSnapshot     = _getText()
+        _lastHash        = _hash(_getText())  // 始终基于文本哈希，与 XML 是否可用无关
+        _lastContent     = _getText()
         _lastImageHashes = _getImageHashes()
         if (pollingTimer)  clearInterval(pollingTimer)
         if (autoSaveTimer) clearInterval(autoSaveTimer)
         pollingTimer  = setInterval(_checkAndSync, POLL_INTERVAL)
         autoSaveTimer = setInterval(_doAutoSave,   AUTO_SAVE_INTERVAL)
-        console.log('[Sync] 文档同步已启动，绑定文档:', _boundDoc ? (_boundDoc.Name || 'ok') : 'ActiveDocument')
+        console.log('[Sync] 文档同步已启动，绑定文档:', _boundDoc ? (_boundDoc.Name || 'ok') : 'ActiveDocument',
+                    '，XML支持:', _getContent() !== '' ? '是' : '否')
     }
 
     // ── 停止同步 ──────────────────────────────────────────────
     function stop() {
         if (pollingTimer)  { clearInterval(pollingTimer);  pollingTimer  = null }
         if (autoSaveTimer) { clearInterval(autoSaveTimer); autoSaveTimer = null }
-        lastSnapshot     = ''
+        _lastContent     = ''
+        _lastHash        = 0
         isApplying       = false
         _pendingAck      = false
         _boundDoc        = null
         _syncedImageIds  = {}
+        _imageRegistry   = []
         _lastImageHashes = []
         console.log('[Sync] 文档同步已停止')
     }
@@ -348,20 +388,26 @@ var DocSync = (function () {
     }
 
     return {
-        start:                start,
-        stop:                 stop,
-        applyRemote:          applyRemote,
-        applyRemoteImage:     applyRemoteImage,
-        initFromSnapshot:     initFromSnapshot,
-        uploadLocalImage:     uploadLocalImage,
-        pushInitialContent:   pushInitialContent,
-        isRunning:            isRunning,
-        getLocalText:         _getText,
-        updateSeq:            function(seq) {
-            // ack 到达：更新 seq（取 max 防止乱序降级），清除挂起锁，立即检测累积变更
-            if (seq !== undefined && seq !== null) _lastSeq = Math.max(_lastSeq, seq)
+        start:               start,
+        stop:                stop,
+        applyRemoteContent:  applyRemoteContent,
+        applyRemoteImage:    applyRemoteImage,
+        initFromSnapshot:    initFromSnapshot,
+        uploadLocalImage:    uploadLocalImage,
+        pushInitialContent:  pushInitialContent,
+        isRunning:           isRunning,
+        getLocalText:        _getText,
+        contentAck:          function () {
+            // 服务器确认 content_update 已处理，清除发送锁，立即检测累积变更
             _pendingAck = false
-            _checkAndSync()  // 立即发送等待期间累积的变更，无需等下一个 300ms 周期
+            _checkAndSync()
+        },
+        addLocalImage:       function (fileId, url, position, w, h) {
+            // 上传者调用：注册本地图片，防止收到服务器广播时重复插入
+            if (_syncedImageIds[fileId]) return
+            _syncedImageIds[fileId] = true
+            _imageRegistry.push({ file_id: fileId, url: url, position: position, img_width: w, img_height: h })
+            _lastImageHashes = _getImageHashes()
         },
     }
 })()

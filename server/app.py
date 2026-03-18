@@ -705,8 +705,8 @@ def upload_image():
 
     img_url = '/api/images/' + file_id
 
-    # 广播给房间内其他成员
-    broadcast(doc_id, {
+    # 仅广播给其他成员（不含上传者自己，避免上传者重复插入）
+    _img_msg = json.dumps({
         'type':             'insert_image',
         'file_id':          file_id,
         'url':              img_url,
@@ -716,7 +716,13 @@ def upload_image():
         'insert_after_para':insert_after_para,
         'img_width':        img_width,
         'img_height':       img_height,
-    })
+    }, ensure_ascii=False)
+    for _entry in list(rooms.get(doc_id, [])):
+        if _entry['username'] != user['username']:
+            try:
+                _entry['ws'].send(_img_msg)
+            except Exception:
+                pass
 
     return jsonify({
         'file_id': file_id,
@@ -1140,6 +1146,21 @@ def collab_ws(ws):
                 path = (msg.get('path') or '').strip()
                 if path:
                     set_doc_path(doc_id, path)
+
+            elif msg_type == 'content_update':
+                # 客户端推送完整 XML 内容（含格式），广播给其他成员并更新服务器快照
+                xml = msg.get('xml', '')
+                if xml:
+                    with doc_snapshots_lock:
+                        snap = doc_snapshots.get(doc_id, {'content': '', 'seq': 0})
+                        new_seq = snap['seq'] + 1
+                        doc_snapshots[doc_id] = {'content': xml, 'seq': new_seq}
+                    broadcast(doc_id, {
+                        'type': 'content_update',
+                        'xml':  xml,
+                        'from': username,
+                    }, exclude_ws=ws)
+                ws.send(json.dumps({'type': 'content_ack'}))
 
             elif msg_type == 'get_snapshot':
                 # 客户端主动请求最新快照（用于解决竞态：welcome 为空时延迟重试）

@@ -618,15 +618,14 @@ function _handleServerMsg(msg, boundDoc) {
             _refreshNotifBadge()
             break
 
-        case 'change_ack':
-            // 服务器确认我方发出的 change 已处理，更新 _lastSeq。
-            // 否则 _lastSeq 永远为 0，每次发送的 base_seq 都是 0，
-            // 导致服务器对全量历史做 OT 变换，位置偏移不断累积产生乱蹦字。
-            DocSync.updateSeq(msg.seq)
+        case 'content_ack':
+            // 服务器确认 content_update 已处理，清除发送锁，立即检测累积变更
+            DocSync.contentAck()
             break
 
-        case 'change':
-            DocSync.applyRemote(msg.delta, msg.seq)  // 传入 seq 更新本地计数器
+        case 'content_update':
+            // 接收远程完整 XML 内容（含文字+格式），应用到本地文档
+            DocSync.applyRemoteContent(msg.xml)
             break
 
         case 'insert_image':
@@ -737,6 +736,8 @@ function onImageFileSelected(input) {
                     } catch (ex) {
                         console.warn('[Image] 本地插入失败，图片已上传至服务器', ex)
                     }
+                    // 注册到 DocSync，防止收到服务器 insert_image 广播时重复插入
+                    DocSync.addLocalImage(res.file_id, res.url, pos, res.img_width, res.img_height)
                     setError('img-error', '')
                 } else {
                     setError('img-error', res.error || '上传失败')
