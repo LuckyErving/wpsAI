@@ -1173,6 +1173,16 @@ def collab_ws(ws):
                     'images':  _imgs,
                 }, ensure_ascii=False))
 
+            elif msg_type == 'format_op':
+                # 插件内显式格式操作：稳定、可控，优先作为格式协同主链路
+                op = msg.get('op') or {}
+                if op:
+                    broadcast(doc_id, {
+                        'type': 'format_op',
+                        'op': op,
+                        'from': username,
+                    }, exclude_ws=ws)
+
             elif msg_type == 'ping':
                 ws.send(json.dumps({'type': 'pong'}))
 

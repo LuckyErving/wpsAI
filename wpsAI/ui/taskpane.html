@@ -230,6 +230,39 @@
             font-size: 11px;
         }
         .restore-btn:hover { background: #e8f0fe; }
+
+        .format-toolbar {
+            border: 1px solid #e8eaed;
+            border-radius: 6px;
+            padding: 10px;
+            margin-bottom: 8px;
+            background: #fff;
+        }
+        .format-row {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 6px;
+        }
+        .format-row:last-child { margin-bottom: 0; }
+        .format-btn {
+            flex: 1;
+            padding: 7px 0;
+            border: 1px solid #d2d6dc;
+            border-radius: 4px;
+            background: #f8fafc;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .format-input, .format-select {
+            flex: 1;
+            min-width: 0;
+            padding: 7px 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 12px;
+            outline: none;
+        }
     </style>
 </head>
 
@@ -321,6 +354,28 @@
     <div id="online-section" style="display:none">
         <div class="section-label">在线协作者</div>
         <div class="user-list" id="user-list"></div>
+        <div class="section-label">协同格式（通过本面板触发）</div>
+        <div class="format-toolbar">
+            <div class="format-row">
+                <button class="format-btn" onclick="applyFormatToggle('bold')">B 加粗</button>
+                <button class="format-btn" onclick="applyFormatToggle('italic')">I 斜体</button>
+                <button class="format-btn" onclick="applyFormatToggle('underline')">U 下划线</button>
+            </div>
+            <div class="format-row">
+                <input id="format-size-input" class="format-input" type="number" min="1" placeholder="字号，如 14" />
+                <button class="format-btn" onclick="applyFontSize()">设置字号</button>
+            </div>
+            <div class="format-row">
+                <select id="format-color-select" class="format-select">
+                    <option value="0">黑色</option>
+                    <option value="255">红色</option>
+                    <option value="65280">绿色</option>
+                    <option value="16711680">蓝色</option>
+                </select>
+                <button class="format-btn" onclick="applyFontColor()">设置颜色</button>
+            </div>
+            <div class="error-msg" id="format-error"></div>
+        </div>
         <button class="btn btn-success" onclick="openShareView()" style="margin-bottom:6px">
             &#43; 邀请协作者
         </button>
@@ -632,6 +687,10 @@ function _handleServerMsg(msg, boundDoc) {
             DocSync.applyRemoteImage(msg)
             break
 
+        case 'format_op':
+            DocSync.applyRemoteFormatOp(msg)
+            break
+
         case 'invitation':
             _queueInvitation(msg)
             // 同时更新通知徽标
@@ -689,6 +748,26 @@ function _updateUserList(users, selfUsername) {
 // ── 图片上传 ──────────────────────────────
 function triggerImagePick() {
     document.getElementById('img-file-input').click()
+}
+
+function applyFormatToggle(kind) {
+    setError('format-error', '')
+    var res = DocSync.applyLocalFormat(kind)
+    if (!res.ok) setError('format-error', res.error || '格式设置失败')
+}
+
+function applyFontSize() {
+    setError('format-error', '')
+    var size = document.getElementById('format-size-input').value
+    var res = DocSync.applyLocalFormat('size', size)
+    if (!res.ok) setError('format-error', res.error || '字号设置失败')
+}
+
+function applyFontColor() {
+    setError('format-error', '')
+    var color = document.getElementById('format-color-select').value
+    var res = DocSync.applyLocalFormat('color', color)
+    if (!res.ok) setError('format-error', res.error || '颜色设置失败')
 }
 
 function onImageFileSelected(input) {

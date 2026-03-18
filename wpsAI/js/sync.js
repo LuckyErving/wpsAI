@@ -82,6 +82,78 @@ var DocSync = (function () {
         } catch (e) { return 0 }
     }
 
+    function _getSelectionRangeInfo() {
+        try {
+            var sel = window.Application && window.Application.Selection
+            if (!sel || !sel.Range) return null
+            var start = Number(sel.Range.Start || 0)
+            var end = Number(sel.Range.End || start)
+            if (end <= start) return null
+            return { start: start, end: end }
+        } catch (e) {
+            return null
+        }
+    }
+
+    function _applyFormatOp(op) {
+        if (!op) return false
+        try {
+            var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
+            if (!doc) return false
+            var start = Number(op.start || 0)
+            var end = Number(op.end || start)
+            if (end <= start) return false
+            var range = doc.Range(start, end)
+            if (!range || !range.Font) return false
+            var attrs = op.charAttrs || {}
+            if (attrs.bold !== undefined) range.Font.Bold = attrs.bold ? 1 : 0
+            if (attrs.italic !== undefined) range.Font.Italic = attrs.italic ? 1 : 0
+            if (attrs.underline !== undefined) range.Font.Underline = attrs.underline ? 1 : 0
+            if (attrs.size !== undefined && Number(attrs.size) > 0) range.Font.Size = Number(attrs.size)
+            if (attrs.color !== undefined) range.Font.Color = Number(attrs.color)
+            if (attrs.name !== undefined && attrs.name) range.Font.Name = String(attrs.name)
+            return true
+        } catch (e) {
+            console.error('[Sync] 应用格式操作失败', e)
+            return false
+        }
+    }
+
+    function _buildFormatOp(kind, value) {
+        var sel = _getSelectionRangeInfo()
+        if (!sel) return { error: '请先选中文本后再设置格式' }
+
+        var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
+        if (!doc) return { error: '当前没有活动文档' }
+        var range = doc.Range(sel.start, sel.end)
+        if (!range || !range.Font) return { error: '当前选区不支持格式设置' }
+
+        var attrs = {}
+        if (kind === 'bold') {
+            attrs.bold = range.Font.Bold ? 0 : 1
+        } else if (kind === 'italic') {
+            attrs.italic = range.Font.Italic ? 0 : 1
+        } else if (kind === 'underline') {
+            attrs.underline = range.Font.Underline ? 0 : 1
+        } else if (kind === 'size') {
+            var size = Number(value)
+            if (!size || size <= 0) return { error: '字号必须大于 0' }
+            attrs.size = size
+        } else if (kind === 'color') {
+            var color = Number(value)
+            if (isNaN(color)) return { error: '颜色值无效' }
+            attrs.color = color
+        } else {
+            return { error: '不支持的格式操作' }
+        }
+
+        return {
+            start: sel.start,
+            end: sel.end,
+            charAttrs: attrs,
+        }
+    }
+
     // ── 获取当前文档 InlineShapes 哈希列表（图片检测用）────────
     // 使用图片宽度+高度+段落索引做简单指纹，WPS 无法直接读取图片字节
     function _getImageHashes() {
@@ -408,6 +480,31 @@ var DocSync = (function () {
             _syncedImageIds[fileId] = true
             _imageRegistry.push({ file_id: fileId, url: url, position: position, img_width: w, img_height: h })
             _lastImageHashes = _getImageHashes()
+        },
+        applyLocalFormat:    function (kind, value) {
+            var op = _buildFormatOp(kind, value)
+            if (op.error) return { ok: false, error: op.error }
+            isApplying = true
+            try {
+                if (!_applyFormatOp(op)) {
+                    return { ok: false, error: '格式应用失败' }
+                }
+            } finally {
+                isApplying = false
+            }
+            if (WSManager.connected()) {
+                WSManager.send({ type: 'format_op', op: op })
+            }
+            return { ok: true }
+        },
+        applyRemoteFormatOp: function (msg) {
+            if (!msg || !msg.op) return
+            isApplying = true
+            try {
+                _applyFormatOp(msg.op)
+            } finally {
+                isApplying = false
+            }
         },
     }
 })()
