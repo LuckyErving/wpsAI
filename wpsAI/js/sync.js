@@ -8,6 +8,7 @@ var DocSync = (function () {
     var pollingTimer  = null
     var lastSnapshot  = ''
     var isApplying    = false  // 操作锁
+    var _lastSeq      = 0      // 最后一次从服务器收到的序列号，发送 change 时带上以支持 OT
     var POLL_INTERVAL = 300    // ms
 
     // ── 获取文档纯文本 ─────────────────────────────────────────
@@ -86,17 +87,48 @@ var DocSync = (function () {
         // 无实际变化时不发送
         if (delta.deleteCount === 0 && delta.insert === '') return
 
-        WSManager.send({ type: 'change', delta: delta })
+        WSManager.send({ type: 'change', delta: delta, base_seq: _lastSeq })
     }
 
     // ── 接收并应用远程 delta ──────────────────────────────────
-    function applyRemote(delta) {
+    function applyRemote(delta, seq) {
         if (!delta) return
+        if (seq !== undefined && seq !== null) _lastSeq = seq
         isApplying = true
         try {
             _applyDelta(delta)
             // 更新快照，避免轮询误判为本地变更
             lastSnapshot = _getText()
+        } finally {
+            isApplying = false
+        }
+    }
+
+    // ── 用服务器快照初始化本地文档 ──────────────────────
+    function initFromSnapshot(content, seq) {
+        // seq 必须先更新，即使内容为空也要记录
+        if (seq !== undefined && seq !== null) _lastSeq = seq
+        if (content === undefined || content === null) return
+        if (content === '') {
+            lastSnapshot = ''
+            return
+        }
+        isApplying = true
+        try {
+            var currentText = _getText()
+            if (currentText === content) {
+                lastSnapshot = content
+                return
+            }
+            var doc = window.Application && window.Application.ActiveDocument
+            if (!doc) return
+            // 用服务器内容覆盖本地标准区域
+            var range = doc.Range(0, currentText.length)
+            range.Text = content
+            lastSnapshot = content
+            console.log('[Sync] 已从服务器初始化内容，seq=' + seq + '，长度:' + content.length)
+        } catch (e) {
+            console.error('[Sync] 初始化快照失败', e)
         } finally {
             isApplying = false
         }
@@ -126,9 +158,10 @@ var DocSync = (function () {
     }
 
     return {
-        start:       start,
-        stop:        stop,
-        applyRemote: applyRemote,
-        isRunning:   isRunning,
+        start:            start,
+        stop:             stop,
+        applyRemote:      applyRemote,
+        initFromSnapshot: initFromSnapshot,
+        isRunning:        isRunning,
     }
 })()

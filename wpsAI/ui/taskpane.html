@@ -135,6 +135,47 @@
         .doc-row .btn { width: auto; padding: 7px 14px; margin-top: 0; }
 
         hr { border: none; border-top: 1px solid #e8eaed; margin: 12px 0; }
+
+        /* -- 分享视图 ---------------------- */
+        .share-search {
+            width: 100%; padding: 7px 10px;
+            border: 1px solid #ddd; border-radius: 4px;
+            font-size: 13px; outline: none; margin-bottom: 8px;
+        }
+        .share-search:focus { border-color: #1a73e8; }
+        #share-user-groups { max-height: 230px; overflow-y: auto; margin-bottom: 6px; }
+        .unit-section { margin-bottom: 10px; }
+        .unit-label {
+            font-size: 11px; font-weight: bold; color: #5f6368;
+            background: #f1f3f4; padding: 3px 8px; border-radius: 3px; margin-bottom: 3px;
+        }
+        .user-check-item {
+            display: flex; align-items: center; gap: 8px;
+            padding: 5px 8px; border-radius: 4px;
+            cursor: pointer; transition: background .12s;
+        }
+        .user-check-item:hover { background: #f0f4ff; }
+        .user-check-item input[type=checkbox] { width: 14px; height: 14px; cursor: pointer; flex-shrink: 0; }
+        .user-check-name { font-size: 13px; flex: 1; }
+        .user-check-login { font-size: 11px; color: #bbb; }
+        .share-btn-row { display: flex; gap: 6px; margin-top: 10px; }
+        .share-btn-row .btn { flex: 1; }
+
+        /* -- 邀请弹窗 ---------------------- */
+        .modal-overlay {
+            display: none; position: fixed; inset: 0;
+            background: rgba(0,0,0,.5); z-index: 999;
+            align-items: center; justify-content: center;
+        }
+        .modal-overlay.active { display: flex; }
+        .modal-box {
+            background: #fff; border-radius: 8px; padding: 20px;
+            width: 260px; box-shadow: 0 6px 28px rgba(0,0,0,.22);
+        }
+        .modal-box .title { margin-bottom: 8px; }
+        .modal-body { font-size: 13px; color: #444; line-height: 1.7; margin-bottom: 14px; }
+        .modal-actions { display: flex; gap: 8px; }
+        .modal-actions .btn { flex: 1; }
     </style>
 </head>
 
@@ -177,6 +218,10 @@
     <div class="form-group">
         <label>真实姓名 <span style="color:#999;font-size:11px">（可选）</span></label>
         <input id="reg-realname" type="text" placeholder="如：张三" />
+    </div>
+    <div class="form-group">
+        <label>所属单位 <span style="color:#999;font-size:11px">（可选）</span></label>
+        <input id="reg-unit" type="text" placeholder="如：侦查大队" />
     </div>
     <div class="form-group">
         <label>密码 <span style="color:#999;font-size:11px">（至少6位）</span></label>
@@ -222,13 +267,57 @@
     <div id="online-section" style="display:none">
         <div class="section-label">在线协作者</div>
         <div class="user-list" id="user-list"></div>
+        <button class="btn btn-success" onclick="openShareView()" style="margin-bottom:6px">
+            &#43; 邀请协作者
+        </button>
         <button class="btn btn-danger" onclick="leaveCollab()" style="margin-bottom:6px">
-            ✕ 停止协作
+            &#10005; 停止协作
         </button>
     </div>
 
     <hr>
     <button class="btn btn-secondary" onclick="doLogout()">退出登录</button>
+</div>
+
+
+<!-- ═══════════════════════
+     视图 4：邀请协作者
+═══════════════════════ -->
+<div id="view-share" class="view">
+    <div class="title">&#128228; 邀请协作者</div>
+    <div style="font-size:12px;color:#666;margin-bottom:10px">
+        文档：<strong id="share-doc-id"></strong>
+    </div>
+
+    <input id="share-search" class="share-search"
+           type="text" placeholder="搜索姓名 / 用户名 / 单位…"
+           oninput="filterShareUsers()" />
+
+    <div id="share-user-groups">
+        <div style="color:#999;font-size:12px;padding:20px 0;text-align:center">加载中…</div>
+    </div>
+
+    <div class="error-msg" id="share-error"></div>
+
+    <div class="share-btn-row">
+        <button class="btn btn-primary" onclick="sendInvite()">&#128232; 发送邀请</button>
+        <button class="btn btn-secondary" onclick="showView('view-collab')">取消</button>
+    </div>
+</div>
+
+
+<!-- ═══════════════════════
+     邀请通知弹窗
+═══════════════════════ -->
+<div id="invite-modal" class="modal-overlay">
+    <div class="modal-box">
+        <div class="title">&#128232; 收到协作邀请</div>
+        <div class="modal-body" id="invite-modal-text"></div>
+        <div class="modal-actions">
+            <button class="btn btn-success" onclick="respondCurrentInvite('accept')">&#10004; 接受</button>
+            <button class="btn btn-secondary" onclick="respondCurrentInvite('reject')">&#10006; 拒绝</button>
+        </div>
+    </div>
 </div>
 
 
@@ -312,7 +401,7 @@ function doRegister() {
         return
     }
 
-    Auth.register(username, password, realname).then(function (res) {
+    Auth.register(username, password, realname, document.getElementById('reg-unit').value.trim()).then(function (res) {
         if (res.ok) {
             alert('注册成功！请登录。')
             document.getElementById('login-username').value = username
@@ -379,12 +468,17 @@ function _handleServerMsg(msg) {
             _updateUserList(msg.users, msg.username)
             document.getElementById('online-section').style.display = 'block'
             document.getElementById('btn-join').style.display = 'none'
+            DocSync.initFromSnapshot(msg.content, msg.seq)  // 初始化内容与 seq
             DocSync.start()
             setStatus('connected', '协作中 · ' + msg.doc_id)
             break
 
         case 'change':
-            DocSync.applyRemote(msg.delta)
+            DocSync.applyRemote(msg.delta, msg.seq)  // 传入 seq 更新本地计数器
+            break
+
+        case 'invitation':
+            _queueInvitation(msg)
             break
 
         case 'user_join':
@@ -431,9 +525,191 @@ window.onload = function () {
             Auth.getRealname() || Auth.getUsername()
         _prefillDocId()
         showView('view-collab')
+        _startInvitePolling()  // 登录状态下开启轮询容错率
     } else {
         showView('view-login')
     }
+}
+
+// ─────────────────────────────────────────────
+//  邀请功能
+// ─────────────────────────────────────────────
+
+// -- 分享视图数据 ———————————————————————
+var _allUserGroups = []   // [{unit, users:[{username,realname}]}]
+
+function openShareView() {
+    var docId = document.getElementById('doc-id-input').value.trim()
+    document.getElementById('share-doc-id').textContent = docId
+    document.getElementById('share-error').textContent  = ''
+    document.getElementById('share-search').value       = ''
+    showView('view-share')
+    _loadUserList()
+}
+
+function _loadUserList() {
+    var container = document.getElementById('share-user-groups')
+    container.innerHTML = '<div style="color:#999;font-size:12px;padding:20px 0;text-align:center">加载中…</div>'
+
+    fetch(COLLAB_CONFIG.SERVER_HTTP + '/api/users', {
+        headers: { 'Authorization': 'Bearer ' + Auth.getToken() }
+    })
+    .then(function (res) { return res.json() })
+    .then(function (data) {
+        _allUserGroups = data.groups || []
+        _renderUserGroups(_allUserGroups)
+    })
+    .catch(function () {
+        container.innerHTML = '<div style="color:#ea4335;font-size:12px;padding:10px 0">加载失败，请重试</div>'
+    })
+}
+
+function _renderUserGroups(groups) {
+    var container = document.getElementById('share-user-groups')
+    if (!groups || !groups.length) {
+        container.innerHTML = '<div style="color:#999;font-size:12px;padding:20px 0;text-align:center">暂无其他已注册用户</div>'
+        return
+    }
+    container.innerHTML = groups.map(function (g) {
+        var items = g.users.map(function (u) {
+            return '<label class="user-check-item">'
+                + '<input type="checkbox" class="share-check" value="' + u.username + '">'
+                + '<span class="user-check-name">' + (u.realname || u.username) + '</span>'
+                + '<span class="user-check-login">' + u.username + '</span>'
+                + '</label>'
+        }).join('')
+        return '<div class="unit-section">'
+            + '<div class="unit-label">' + g.unit + '</div>'
+            + items
+            + '</div>'
+    }).join('')
+}
+
+function filterShareUsers() {
+    var kw = document.getElementById('share-search').value.trim().toLowerCase()
+    if (!kw) {
+        _renderUserGroups(_allUserGroups)
+        return
+    }
+    var filtered = _allUserGroups.map(function (g) {
+        return {
+            unit: g.unit,
+            users: g.users.filter(function (u) {
+                return (u.realname || '').toLowerCase().indexOf(kw) >= 0
+                    || u.username.toLowerCase().indexOf(kw) >= 0
+                    || g.unit.toLowerCase().indexOf(kw) >= 0
+            })
+        }
+    }).filter(function (g) { return g.users.length > 0 })
+    _renderUserGroups(filtered)
+}
+
+function sendInvite() {
+    var checked = document.querySelectorAll('.share-check:checked')
+    if (!checked.length) {
+        setError('share-error', '请勾选至少一个协作者')
+        return
+    }
+    var usernames = []
+    checked.forEach(function (el) { usernames.push(el.value) })
+    var docId = document.getElementById('doc-id-input').value.trim()
+    setError('share-error', '')
+
+    fetch(COLLAB_CONFIG.SERVER_HTTP + '/api/invite', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + Auth.getToken()
+        },
+        body: JSON.stringify({ doc_id: docId, usernames: usernames })
+    })
+    .then(function (res) { return res.json() })
+    .then(function (data) {
+        if (data.invited !== undefined) {
+            alert('已向 ' + data.invited + ' 人发送邀请\u002c等待对方同意后即可加入。')
+            showView('view-collab')
+        } else {
+            setError('share-error', data.error || '发送失败')
+        }
+    })
+    .catch(function () { setError('share-error', '网络错误，请重试') })
+}
+
+// -- 邀请队列 ———————————————————————
+var _inviteQueue    = []    // 待处理邀请队列
+var _invitePolling  = null  // setInterval ID
+var _knownInviteIds = {}    // {id: true}
+
+function _queueInvitation(inv) {
+    if (_knownInviteIds[inv.invite_id]) return
+    _knownInviteIds[inv.invite_id] = true
+    _inviteQueue.push(inv)
+    if (_inviteQueue.length === 1) _showNextInvite()
+}
+
+function _showNextInvite() {
+    if (!_inviteQueue.length) return
+    var inv = _inviteQueue[0]
+    var name = inv.from_realname || inv.from_user
+    document.getElementById('invite-modal-text').innerHTML =
+        '<strong>' + name + '</strong> 邀请您共同编辑文档：<br>'
+        + '<strong style="color:#1a73e8">' + inv.doc_id + '</strong>'
+    document.getElementById('invite-modal').classList.add('active')
+}
+
+function respondCurrentInvite(action) {
+    if (!_inviteQueue.length) return
+    var inv = _inviteQueue.shift()
+    document.getElementById('invite-modal').classList.remove('active')
+
+    fetch(COLLAB_CONFIG.SERVER_HTTP + '/api/invite/' + inv.invite_id + '/respond', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + Auth.getToken()
+        },
+        body: JSON.stringify({ action: action })
+    })
+    .then(function (res) { return res.json() })
+    .then(function (data) {
+        if (action === 'accept' && data.ok) {
+            _joinByDocId(data.doc_id)
+        }
+        // 处理下一个邀请（如果有）
+        setTimeout(_showNextInvite, 300)
+    })
+    .catch(function () { setTimeout(_showNextInvite, 300) })
+}
+
+function _joinByDocId(docId) {
+    // 如果已在另一个房间，先退出
+    if (DocSync.isRunning()) leaveCollab()
+    showView('view-collab')
+    setTimeout(function () {
+        document.getElementById('doc-id-input').value = docId
+        joinCollab()
+    }, 200)
+}
+
+// -- 轮询未处理邀请（用户尚未加入任何房间时的容错率）———
+function _startInvitePolling() {
+    if (_invitePolling) return
+    _invitePolling = setInterval(function () {
+        if (!Auth.isLoggedIn()) return
+        if (DocSync.isRunning()) return  // WS 已在线，由 WS 推送，无需轮询
+        fetch(COLLAB_CONFIG.SERVER_HTTP + '/api/invite/pending', {
+            headers: { 'Authorization': 'Bearer ' + Auth.getToken() }
+        })
+        .then(function (res) { return res.json() })
+        .then(function (data) {
+            (data.invitations || []).forEach(_queueInvitation)
+        })
+        .catch(function () {})
+    }, 5000)
+}
+
+function _stopInvitePolling() {
+    if (_invitePolling) { clearInterval(_invitePolling); _invitePolling = null }
 }
 </script>
 
