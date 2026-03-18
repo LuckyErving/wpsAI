@@ -366,8 +366,40 @@
                 <button class="format-btn" onclick="applyFontSize()">设置字号</button>
             </div>
             <div class="format-row">
+                <select id="format-cn-size-select" class="format-select">
+                    <option value="">中文字号（如 一号）</option>
+                    <option value="初号">初号</option>
+                    <option value="小初">小初</option>
+                    <option value="一号">一号</option>
+                    <option value="小一">小一</option>
+                    <option value="二号">二号</option>
+                    <option value="小二">小二</option>
+                    <option value="三号">三号</option>
+                    <option value="小三">小三</option>
+                    <option value="四号">四号</option>
+                    <option value="小四" selected>小四</option>
+                    <option value="五号">五号</option>
+                    <option value="小五">小五</option>
+                    <option value="六号">六号</option>
+                    <option value="小六">小六</option>
+                    <option value="七号">七号</option>
+                    <option value="八号">八号</option>
+                </select>
+                <button class="format-btn" onclick="applyCnFontSize()">设置号数</button>
+            </div>
+            <div class="format-row">
                 <button class="format-btn" onclick="applyFontSizeDelta(-1)">A- 缩小</button>
                 <button class="format-btn" onclick="applyFontSizeDelta(1)">A+ 增大</button>
+            </div>
+            <div class="format-row">
+                <select id="format-preset-select" class="format-select">
+                    <option value="title">标题</option>
+                    <option value="subtitle">副标题</option>
+                    <option value="heading1">一级标题</option>
+                    <option value="heading2">二级标题</option>
+                    <option value="body" selected>正文</option>
+                </select>
+                <button class="format-btn" onclick="applyPresetStyle()">应用样式</button>
             </div>
             <div class="format-row">
                 <select id="format-name-select" class="format-select">
@@ -779,10 +811,24 @@ function applyFontSize() {
     if (!res.ok) setError('format-error', res.error || '字号设置失败')
 }
 
+function applyCnFontSize() {
+    setError('format-error', '')
+    var cnSize = document.getElementById('format-cn-size-select').value
+    var res = DocSync.applyLocalFormat('size', cnSize)
+    if (!res.ok) setError('format-error', res.error || '号数字号设置失败')
+}
+
 function applyFontSizeDelta(delta) {
     setError('format-error', '')
     var res = DocSync.applyLocalFormat('size_delta', delta)
     if (!res.ok) setError('format-error', res.error || '字号调整失败')
+}
+
+function applyPresetStyle() {
+    setError('format-error', '')
+    var preset = document.getElementById('format-preset-select').value
+    var res = DocSync.applyLocalFormat('preset', preset)
+    if (!res.ok) setError('format-error', res.error || '样式应用失败')
 }
 
 function applyFontColor() {

@@ -108,10 +108,11 @@ var DocSync = (function () {
             var range = doc.Range(start, end)
             if (!range || !range.Font) return false
             var attrs = op.charAttrs || {}
+            var sizeNum = Number(attrs.size)
             if (attrs.bold !== undefined) range.Font.Bold = attrs.bold ? 1 : 0
             if (attrs.italic !== undefined) range.Font.Italic = attrs.italic ? 1 : 0
             if (attrs.underline !== undefined) range.Font.Underline = attrs.underline ? 1 : 0
-            if (attrs.size !== undefined && Number(attrs.size) > 0) range.Font.Size = Number(attrs.size)
+            if (attrs.size !== undefined && isFinite(sizeNum) && sizeNum > 0) range.Font.Size = sizeNum
             if (attrs.color !== undefined) range.Font.Color = Number(attrs.color)
             if (attrs.name !== undefined && attrs.name) range.Font.Name = String(attrs.name)
             return true
@@ -119,6 +120,88 @@ var DocSync = (function () {
             console.error('[Sync] 应用格式操作失败', e)
             return false
         }
+    }
+
+    // ── 中文字号映射（号数 -> 磅值）──────────────────────────
+    function _getCnSizeMap() {
+        return {
+            '初号': 42,
+            '小初': 36,
+            '一号': 26,
+            '小一': 24,
+            '二号': 22,
+            '小二': 18,
+            '三号': 16,
+            '小三': 15,
+            '四号': 14,
+            '小四': 12,
+            '五号': 10.5,
+            '小五': 9,
+            '六号': 7.5,
+            '小六': 6.5,
+            '七号': 5.5,
+            '八号': 5,
+        }
+    }
+
+    function _parseSizeValue(value) {
+        var raw = String(value == null ? '' : value).trim()
+        if (!raw) return NaN
+        var map = _getCnSizeMap()
+        if (map[raw] !== undefined) return map[raw]
+        var num = Number(raw)
+        return isFinite(num) ? num : NaN
+    }
+
+    function _getSizeStepsAsc() {
+        return [5, 5.5, 6.5, 7.5, 9, 10.5, 12, 14, 15, 16, 18, 22, 24, 26, 36, 42]
+    }
+
+    function _resolveNextSize(currentSize, direction) {
+        var steps = _getSizeStepsAsc()
+        var current = Number(currentSize)
+        if (!isFinite(current) || current <= 0) current = 12
+
+        var index = 0
+        var minDiff = Infinity
+        for (var i = 0; i < steps.length; i++) {
+            var diff = Math.abs(steps[i] - current)
+            if (diff < minDiff) {
+                minDiff = diff
+                index = i
+            }
+        }
+
+        if (direction > 0) {
+            if (steps[index] <= current && index < steps.length - 1) index++
+        } else if (direction < 0) {
+            if (steps[index] >= current && index > 0) index--
+        }
+
+        if (index < 0) index = 0
+        if (index >= steps.length) index = steps.length - 1
+        return steps[index]
+    }
+
+    function _resolvePresetAttrs(preset) {
+        var key = String(preset || '').trim()
+        if (!key) return null
+        if (key === 'title') {
+            return { name: '黑体', size: 16, bold: 1 }
+        }
+        if (key === 'subtitle') {
+            return { name: '楷体', size: 15, bold: 1 }
+        }
+        if (key === 'heading1') {
+            return { name: '黑体', size: 14, bold: 1 }
+        }
+        if (key === 'heading2') {
+            return { name: '黑体', size: 12, bold: 1 }
+        }
+        if (key === 'body') {
+            return { name: '宋体', size: 12, bold: 0, italic: 0, underline: 0, color: 0 }
+        }
+        return null
     }
 
     function _buildFormatOp(kind, value) {
@@ -138,15 +221,15 @@ var DocSync = (function () {
         } else if (kind === 'underline') {
             attrs.underline = range.Font.Underline ? 0 : 1
         } else if (kind === 'size') {
-            var size = Number(value)
-            if (!size || size <= 0) return { error: '字号必须大于 0' }
+            var size = _parseSizeValue(value)
+            if (!isFinite(size) || size <= 0) return { error: '字号无效，请输入磅值或如“一号”' }
             attrs.size = size
         } else if (kind === 'size_delta') {
             var delta = Number(value || 0)
             if (!delta) return { error: '字号增量无效' }
             var currentSize = Number(range.Font.Size || 12)
-            var nextSize = currentSize + delta
-            if (nextSize < 1) nextSize = 1
+            if (!isFinite(currentSize) || currentSize <= 0) currentSize = 12
+            var nextSize = _resolveNextSize(currentSize, delta > 0 ? 1 : -1)
             attrs.size = nextSize
         } else if (kind === 'color') {
             var color = Number(value)
@@ -156,6 +239,10 @@ var DocSync = (function () {
             var fname = String(value || '').trim()
             if (!fname) return { error: '字体名不能为空' }
             attrs.name = fname
+        } else if (kind === 'preset') {
+            var presetAttrs = _resolvePresetAttrs(value)
+            if (!presetAttrs) return { error: '不支持的样式预设' }
+            attrs = presetAttrs
         } else {
             return { error: '不支持的格式操作' }
         }
