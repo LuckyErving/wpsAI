@@ -26,6 +26,7 @@ var DocSync = (function () {
     // ── 本地图片快照（InlineShapes 的 hash 数组，用于检测新增）
     var _lastImageHashes = []
     var _formatOpsHistory = []  // 最近格式操作历史，用于文本回退覆盖后重放
+    var _lastPlainText = ''     // 最近一次已知纯文本，用于格式区间随文本位移
 
     // ── 简单哈希（djb2），用于快速检测文档内容变化 ────────────
     function _hash(str) {
@@ -140,6 +141,13 @@ var DocSync = (function () {
             var size = Number(value)
             if (!size || size <= 0) return { error: '字号必须大于 0' }
             attrs.size = size
+        } else if (kind === 'size_delta') {
+            var delta = Number(value || 0)
+            if (!delta) return { error: '字号增量无效' }
+            var currentSize = Number(range.Font.Size || 12)
+            var nextSize = currentSize + delta
+            if (nextSize < 1) nextSize = 1
+            attrs.size = nextSize
         } else if (kind === 'color') {
             var color = Number(value)
             if (isNaN(color)) return { error: '颜色值无效' }
@@ -176,6 +184,67 @@ var DocSync = (function () {
         if (!_formatOpsHistory.length) return
         for (var i = 0; i < _formatOpsHistory.length; i++) {
             _applyFormatOp(_formatOpsHistory[i])
+        }
+    }
+
+    // ── 计算 old/new 之间的单段编辑（前后缀法）──────────────
+    function _computeSingleEdit(oldText, newText) {
+        oldText = oldText || ''
+        newText = newText || ''
+        if (oldText === newText) return null
+
+        var oldLen = oldText.length
+        var newLen = newText.length
+        var prefix = 0
+        while (prefix < oldLen && prefix < newLen && oldText.charAt(prefix) === newText.charAt(prefix)) {
+            prefix++
+        }
+
+        var suffix = 0
+        while (suffix < oldLen - prefix && suffix < newLen - prefix &&
+               oldText.charAt(oldLen - 1 - suffix) === newText.charAt(newLen - 1 - suffix)) {
+            suffix++
+        }
+
+        return {
+            pos: prefix,
+            delCount: oldLen - prefix - suffix,
+            insCount: newLen - prefix - suffix,
+        }
+    }
+
+    function _shiftOpByEdit(op, edit) {
+        var s = Number(op.start || 0)
+        var e = Number(op.end || s)
+        var p = Number(edit.pos || 0)
+        var delCount = Number(edit.delCount || 0)
+        var insCount = Number(edit.insCount || 0)
+        var delEnd = p + delCount
+        var delta = insCount - delCount
+
+        if (e <= p) {
+            return op
+        }
+        if (s >= delEnd) {
+            op.start = s + delta
+            op.end = e + delta
+            return op
+        }
+
+        // 与编辑区间重叠：起点被吞并到编辑点，终点按净位移修正
+        var newStart = s < p ? s : p
+        var newEnd = e + delta
+        if (newEnd < newStart) newEnd = newStart
+        op.start = newStart
+        op.end = newEnd
+        return op
+    }
+
+    function _shiftFormatOpsByTextDiff(oldText, newText) {
+        var edit = _computeSingleEdit(oldText, newText)
+        if (!edit) return
+        for (var i = 0; i < _formatOpsHistory.length; i++) {
+            _shiftOpByEdit(_formatOpsHistory[i], edit)
         }
     }
 
@@ -241,6 +310,8 @@ var DocSync = (function () {
         var text = _getText()
         var h    = _hash(text)
         if (h !== _lastHash) {
+            _shiftFormatOpsByTextDiff(_lastPlainText, text)
+            _lastPlainText = text
             _lastHash    = h
             _lastContent = text
             _pendingAck  = true
@@ -259,6 +330,7 @@ var DocSync = (function () {
     function applyRemoteContent(content) {
         if (!content) return
         var usedPlainFallback = false
+        var textAfter = ''
         isApplying = true
         try {
             var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
@@ -281,7 +353,10 @@ var DocSync = (function () {
                 usedPlainFallback = true
             }
             // 用实际读回的文本更新哈希，保证后续轮询基准一致
-            _lastHash    = _hash(_getText())
+            textAfter = _getText()
+            _shiftFormatOpsByTextDiff(_lastPlainText, textAfter)
+            _lastPlainText = textAfter
+            _lastHash    = _hash(textAfter)
             _lastContent = content
         } catch (e) {
             console.error('[Sync] 应用远程内容失败', e)
@@ -307,6 +382,7 @@ var DocSync = (function () {
     function initFromSnapshot(content, seq, images) {
         if (!content) {
             _lastContent = ''
+            _lastPlainText = ''
             _lastHash    = _hash('')
             _applyImageList(images)
             return
@@ -326,7 +402,8 @@ var DocSync = (function () {
                 }
             }
             _lastContent = content
-            _lastHash    = _hash(_getText())  // 始终基于实际文本哈希
+            _lastPlainText = _getText()
+            _lastHash    = _hash(_lastPlainText)  // 始终基于实际文本哈希
             console.log('[Sync] 已从服务器初始化文档，长度:', content.length)
         } catch (e) {
             console.error('[Sync] 初始化快照失败', e)
@@ -463,8 +540,9 @@ var DocSync = (function () {
     function start(docObj) {
         _pendingAck      = false   // 重置：防止重连时旧 ack 未到导致永久卡死
         _boundDoc        = docObj || (window.Application && window.Application.ActiveDocument) || null
-        _lastHash        = _hash(_getText())  // 始终基于文本哈希，与 XML 是否可用无关
-        _lastContent     = _getText()
+        _lastPlainText   = _getText()
+        _lastHash        = _hash(_lastPlainText)  // 始终基于文本哈希，与 XML 是否可用无关
+        _lastContent     = _lastPlainText
         _lastImageHashes = _getImageHashes()
         if (pollingTimer)  clearInterval(pollingTimer)
         if (autoSaveTimer) clearInterval(autoSaveTimer)
@@ -479,6 +557,7 @@ var DocSync = (function () {
         if (pollingTimer)  { clearInterval(pollingTimer);  pollingTimer  = null }
         if (autoSaveTimer) { clearInterval(autoSaveTimer); autoSaveTimer = null }
         _lastContent     = ''
+        _lastPlainText   = ''
         _lastHash        = 0
         isApplying       = false
         _pendingAck      = false

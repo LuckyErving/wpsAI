@@ -366,6 +366,10 @@
                 <button class="format-btn" onclick="applyFontSize()">设置字号</button>
             </div>
             <div class="format-row">
+                <button class="format-btn" onclick="applyFontSizeDelta(-1)">A- 缩小</button>
+                <button class="format-btn" onclick="applyFontSizeDelta(1)">A+ 增大</button>
+            </div>
+            <div class="format-row">
                 <select id="format-name-select" class="format-select">
                     <option value="宋体">宋体</option>
                     <option value="仿宋">仿宋</option>
@@ -773,6 +777,12 @@ function applyFontSize() {
     var size = document.getElementById('format-size-input').value
     var res = DocSync.applyLocalFormat('size', size)
     if (!res.ok) setError('format-error', res.error || '字号设置失败')
+}
+
+function applyFontSizeDelta(delta) {
+    setError('format-error', '')
+    var res = DocSync.applyLocalFormat('size_delta', delta)
+    if (!res.ok) setError('format-error', res.error || '字号调整失败')
 }
 
 function applyFontColor() {
