@@ -114,10 +114,14 @@ var DocSync = (function () {
             .replace(/&amp;/g, '&')
     }
 
+    function _normalizeXmlWhitespace(xml) {
+        return String(xml || '').replace(/>\s+</g, '><')
+    }
+
     function _xmlToPlainText(xml) {
         if (!xml) return ''
         return _decodeXmlEntities(
-            xml
+            _normalizeXmlWhitespace(xml)
                 .replace(/<w:tab\b[^>]*\/>/g, '\t')
                 .replace(/<w:br\b[^>]*\/>/g, '\n')
                 .replace(/<w:cr\b[^>]*\/>/g, '\n')
@@ -125,13 +129,72 @@ var DocSync = (function () {
                 .replace(/<[^>]+>/g, '')
         )
             .replace(/\r/g, '')
+            .replace(/[ \t]+\n/g, '\n')
+            .replace(/\n[ \t]+/g, '\n')
             .replace(/\n{3,}/g, '\n\n')
             .replace(/^\n+|\n+$/g, '')
     }
 
+    function _contentToPlainText(content) {
+        if (!content) return ''
+        var source = String(content)
+        return source.charAt(0) === '<' ? _xmlToPlainText(_stripDrawings(source)) : source
+    }
+
+    function _extractParagraphAlignmentHints(xml) {
+        if (!xml || String(xml).charAt(0) !== '<') return []
+        var hints = []
+        _normalizeXmlWhitespace(xml).replace(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g, function (paragraphXml) {
+            var match = paragraphXml.match(/<w:jc\b[^>]*w:val=["']([^"']+)["'][^>]*\/?\s*>/)
+            hints.push(match ? String(match[1] || '').toLowerCase() : '')
+            return paragraphXml
+        })
+        return hints
+    }
+
+    function _getAlignmentModeValue(key) {
+        var app = window.Application
+        var modes = app && app.Enum && app.Enum.WdAlignmentMode
+        if (key === 'center') return modes && modes.wdCenter !== undefined ? modes.wdCenter : 2
+        if (key === 'right') return modes && modes.wdRight !== undefined ? modes.wdRight : 3
+        if (key === 'both' || key === 'distribute' || key === 'justified' || key === 'justify') {
+            return modes && modes.wdAdjustify !== undefined ? modes.wdAdjustify : 4
+        }
+        if (key === 'distribute-all-lines' || key === 'thai-distribute') {
+            return modes && modes.wdFullAdjustify !== undefined ? modes.wdFullAdjustify : 5
+        }
+        return modes && modes.wdLeft !== undefined ? modes.wdLeft : 1
+    }
+
+    function _reapplyParagraphAlignmentHints(hints) {
+        if (!hints || !hints.length) return
+        try {
+            var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
+            if (!doc || !doc.Content || !doc.Content.Paragraphs) return
+            var paragraphs = doc.Content.Paragraphs
+            var count = Number(paragraphs.Count || 0)
+            var limit = Math.min(count, hints.length)
+            for (var i = 1; i <= limit; i++) {
+                var hint = hints[i - 1]
+                if (!hint) continue
+                try {
+                    var paragraph = paragraphs.Item(i)
+                    var range = paragraph && paragraph.Range
+                    var format = range && range.ParagraphFormat
+                    if (!format || !format.SetAlignment) continue
+                    format.SetAlignment(_getAlignmentModeValue(hint))
+                } catch (e) {
+                    console.warn('[Sync] 段落对齐回放失败', e)
+                }
+            }
+        } catch (e2) {
+            console.warn('[Sync] 段落对齐回放失败', e2)
+        }
+    }
+
     function _getSyncText() {
         var xml = _getContent()
-        if (xml) return _xmlToPlainText(_stripDrawings(xml))
+        if (xml) return _contentToPlainText(xml)
         return _getText()
     }
 
@@ -1000,6 +1063,7 @@ var DocSync = (function () {
         if (!content) return
         var usedPlainFallback = false
         var textAfter = ''
+        var paragraphAlignmentHints = []
         isApplying = true
         try {
             var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
@@ -1016,7 +1080,8 @@ var DocSync = (function () {
             }
             if (!applied) {
                 // 退回：去掉所有 XML 标签只保留文本
-                var plain = isXml ? content.replace(/<[^>]+>/g, '') : content
+                var plain = _contentToPlainText(content)
+                paragraphAlignmentHints = _extractParagraphAlignmentHints(content)
                 var r = doc.Content
                 r.Text = plain
                 usedPlainFallback = true
@@ -1037,7 +1102,10 @@ var DocSync = (function () {
         if (usedPlainFallback) {
             // 文本回退会抹掉字符格式，重放最近格式操作。
             isApplying = true
-            try { _reapplyFormatOps() } finally { isApplying = false }
+            try {
+                _reapplyParagraphAlignmentHints(paragraphAlignmentHints)
+                _reapplyFormatOps()
+            } finally { isApplying = false }
         }
 
         // XML 覆盖文档后重新插入本地已知图片
@@ -1058,6 +1126,8 @@ var DocSync = (function () {
             return
         }
         isApplying = true
+        var usedPlainFallback = false
+        var paragraphAlignmentHints = []
         try {
             var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
             if (doc) {
@@ -1067,8 +1137,10 @@ var DocSync = (function () {
                     try { doc.Content.XML = content; applied = true } catch (e) {}
                 }
                 if (!applied) {
-                    var plain = isXml ? content.replace(/<[^>]+>/g, '') : content
+                    var plain = _contentToPlainText(content)
+                    paragraphAlignmentHints = _extractParagraphAlignmentHints(content)
                     doc.Content.Text = plain
+                    usedPlainFallback = true
                 }
             }
             _lastContent = content
@@ -1079,6 +1151,10 @@ var DocSync = (function () {
             console.error('[Sync] 初始化快照失败', e)
         } finally {
             isApplying = false
+        }
+        if (usedPlainFallback) {
+            isApplying = true
+            try { _reapplyParagraphAlignmentHints(paragraphAlignmentHints) } finally { isApplying = false }
         }
         _applyImageList(images)
     }
