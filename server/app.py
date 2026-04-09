@@ -18,6 +18,8 @@ from dbutils.pooled_db import PooledDB
 
 # ── 配置 ─────────────────────────────────────────────────────
 SECRET_KEY = os.environ.get('SECRET_KEY', 'wps-collab-secret-please-change-in-production')
+TOKEN_TTL_SECONDS = int(os.environ.get('TOKEN_TTL_SECONDS', 30 * 24 * 3600))
+TOKEN_LEEWAY_SECONDS = int(os.environ.get('TOKEN_LEEWAY_SECONDS', 300))
 
 DB_CONFIG = {
     'host':     os.environ.get('DB_HOST',     'localhost'),
@@ -112,10 +114,25 @@ def init_db():
                 insert_after_para INT      DEFAULT -1,
                 img_width    INT           DEFAULT 0,
                 img_height   INT           DEFAULT 0,
+                is_deleted   TINYINT(1)    DEFAULT 0,
                 created      DATETIME      DEFAULT CURRENT_TIMESTAMP,
+                updated      DATETIME      DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 INDEX idx_doc (doc_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         ''')
+
+        try:
+            cur.execute('ALTER TABLE doc_images ADD COLUMN is_deleted TINYINT(1) DEFAULT 0 AFTER img_height')
+        except pymysql.err.OperationalError:
+            pass
+
+        try:
+            cur.execute(
+                'ALTER TABLE doc_images ADD COLUMN updated DATETIME '
+                'DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER created'
+            )
+        except pymysql.err.OperationalError:
+            pass
 
         # 文档历史快照（自动保存）
         cur.execute('''
@@ -151,17 +168,23 @@ def init_db():
 
 # ── JWT ──────────────────────────────────────────────────────
 def create_token(user_id, username):
+    now_ts = int(time.time())
     payload = {
         'user_id': user_id,
         'username': username,
-        'exp': int(time.time()) + 8 * 3600,
-        'iat': int(time.time()),
+        'exp': now_ts + TOKEN_TTL_SECONDS,
+        'iat': now_ts,
     }
     return jwt.encode(payload, SECRET_KEY, algorithm='HS256')
 
 
 def decode_token(token):
-    return jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+    return jwt.decode(
+        token,
+        SECRET_KEY,
+        algorithms=['HS256'],
+        leeway=TOKEN_LEEWAY_SECONDS,
+    )
 
 
 # ── 房间管理 ──────────────────────────────────────────────────
@@ -357,8 +380,8 @@ def _get_doc_images(doc_id):
     with conn.cursor() as cur:
         cur.execute(
             'SELECT file_id, filename, uploader, position, insert_after_para, '
-            '       img_width, img_height, created '
-            'FROM doc_images WHERE doc_id=%s ORDER BY created ASC',
+            '       img_width, img_height, is_deleted, created, updated '
+            'FROM doc_images WHERE doc_id=%s AND is_deleted=0 ORDER BY created ASC',
             (doc_id,)
         )
         rows = cur.fetchall()
@@ -372,10 +395,72 @@ def _get_doc_images(doc_id):
             'insert_after_para':r[4],
             'img_width':        r[5],
             'img_height':       r[6],
+            'deleted':          bool(r[7]),
             'url':              '/api/images/' + r[0],
+            'created_at':       str(r[8]),
+            'updated_at':       str(r[9]),
         }
         for r in rows
     ]
+
+
+def _get_doc_image(file_id):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            'SELECT doc_id, file_id, filename, uploader, position, insert_after_para, '
+            '       img_width, img_height, is_deleted '
+            'FROM doc_images WHERE file_id=%s LIMIT 1',
+            (file_id,)
+        )
+        row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        'doc_id':            row[0],
+        'file_id':           row[1],
+        'filename':          row[2],
+        'uploader':          row[3],
+        'position':          row[4],
+        'insert_after_para': row[5],
+        'img_width':         row[6],
+        'img_height':        row[7],
+        'deleted':           bool(row[8]),
+        'url':               '/api/images/' + row[1],
+    }
+
+
+def _update_doc_image_state(file_id, position=None, img_width=None, img_height=None, is_deleted=None):
+    fields = []
+    params = []
+
+    if position is not None:
+        fields.append('position=%s')
+        params.append(int(position))
+    if img_width is not None:
+        fields.append('img_width=%s')
+        params.append(int(img_width))
+    if img_height is not None:
+        fields.append('img_height=%s')
+        params.append(int(img_height))
+    if is_deleted is not None:
+        fields.append('is_deleted=%s')
+        params.append(1 if is_deleted else 0)
+
+    if not fields:
+        return False
+
+    params.append(file_id)
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            'UPDATE doc_images SET ' + ', '.join(fields) + ' WHERE file_id=%s',
+            tuple(params)
+        )
+    conn.commit()
+    conn.close()
+    return True
 
 
 def join_room(doc_id, ws, username):
@@ -727,6 +812,7 @@ def upload_image():
     return jsonify({
         'file_id': file_id,
         'url':     img_url,
+        'filename': f.filename,
         'img_width':  img_width,
         'img_height': img_height,
     }), 201
@@ -955,6 +1041,7 @@ def collab_ws(ws):
     Client → Server 消息:
       {"type":"change",  "delta":{"position":N,"deleteCount":N,"insert":"..."}, "base_seq":N}
         └─ base_seq: 客户端计算此 delta 时所基于的服务器序列号（用于 OT 变换）
+            {"type":"image_op", "op":"update|delete", "image":{"file_id":"...", ...}}
       {"type":"ping"}
 
     Server → Client 消息:
@@ -962,6 +1049,7 @@ def collab_ws(ws):
         └─ content/seq: 当前文档全文快照及序列号，新成员用于初始化本地内容
       {"type":"change",     "delta":{...}, "from":"username", "seq":N}
         └─ delta 已经过 OT 变换，seq 为本次操作在服务器上的序列号
+            {"type":"image_op",   "op":"update|delete", "image":{...}, "from":"username"}
       {"type":"user_join",  "username":"...", "users":[...]}
       {"type":"user_leave", "username":"...", "users":[...]}
       {"type":"error",      "message":"..."}
@@ -1182,6 +1270,69 @@ def collab_ws(ws):
                         'op': op,
                         'from': username,
                     }, exclude_ws=ws)
+
+            elif msg_type == 'image_op':
+                op_name = (msg.get('op') or '').strip()
+                image = msg.get('image') or {}
+                file_id = (image.get('file_id') or '').strip()
+                if op_name not in ('update', 'delete') or not file_id:
+                    continue
+
+                current = _get_doc_image(file_id)
+                if not current or current['doc_id'] != doc_id:
+                    ws.send(json.dumps({
+                        'type': 'error',
+                        'message': '图片不存在或不属于当前文档',
+                    }, ensure_ascii=False))
+                    continue
+
+                position = int(image.get('position', current['position'] or 0))
+                img_width = int(image.get('img_width', current['img_width'] or 0))
+                img_height = int(image.get('img_height', current['img_height'] or 0))
+
+                if op_name == 'delete':
+                    _update_doc_image_state(file_id, is_deleted=True)
+                    payload = {
+                        'type': 'image_op',
+                        'op': 'delete',
+                        'image': {
+                            'file_id': file_id,
+                            'url': current['url'],
+                            'filename': current['filename'],
+                            'position': current['position'],
+                            'img_width': current['img_width'],
+                            'img_height': current['img_height'],
+                        },
+                        'from': username,
+                    }
+                else:
+                    _update_doc_image_state(
+                        file_id,
+                        position=position,
+                        img_width=img_width,
+                        img_height=img_height,
+                        is_deleted=False,
+                    )
+                    payload = {
+                        'type': 'image_op',
+                        'op': 'update',
+                        'image': {
+                            'file_id': file_id,
+                            'url': current['url'],
+                            'filename': current['filename'],
+                            'position': position,
+                            'img_width': img_width,
+                            'img_height': img_height,
+                        },
+                        'from': username,
+                    }
+
+                broadcast(doc_id, payload, exclude_ws=ws)
+                ws.send(json.dumps({
+                    'type': 'image_op_ack',
+                    'op': op_name,
+                    'file_id': file_id,
+                }, ensure_ascii=False))
 
             elif msg_type == 'ping':
                 ws.send(json.dumps({'type': 'pong'}))

@@ -21,12 +21,17 @@ var DocSync = (function () {
     var _syncedImageIds = {}  // {file_id: true}
 
     // ── 已知图片注册表，在 applyRemoteContent 覆盖文档后重新插入
-    var _imageRegistry = []   // [{file_id, url, position, img_width, img_height}]
+    var _imageRegistry = []   // [{file_id, url, filename, position, img_width, img_height, deleted}]
 
     // ── 本地图片快照（InlineShapes 的 hash 数组，用于检测新增）
     var _lastImageHashes = []
+    var _imageMissCounts = {}  // {file_id: number}，降低误判删除概率
     var _formatOpsHistory = []  // 最近格式操作历史，用于文本回退覆盖后重放
     var _lastPlainText = ''     // 最近一次已知纯文本，用于格式区间随文本位移
+    var _ignoreContentChangesUntil = 0
+    var _pendingImageInsertions = 0
+    var _imageInsertLocks = {}  // {file_id: true}
+    var _lastSentImageState = {}  // {file_id: 'position_width_height'}
 
     // ── 简单哈希（djb2），用于快速检测文档内容变化 ────────────
     function _hash(str) {
@@ -42,7 +47,32 @@ var DocSync = (function () {
     // XML 同步只负责文字和格式；图片通过独立的 insert_image 机制同步
     function _stripDrawings(xml) {
         if (!xml) return xml
-        return xml
+        var cleaned = xml.replace(/<w:r\b[^>]*>[\s\S]*?<\/w:r>/g, function (runXml) {
+            if (!/<w:drawing\b|<w:pict\b/.test(runXml)) return runXml
+
+            var withoutDrawing = runXml
+                .replace(/<w:drawing\b[^>]*>[\s\S]*?<\/w:drawing>/g, '')
+                .replace(/<w:pict\b[^>]*>[\s\S]*?<\/w:pict>/g, '')
+
+            var residual = withoutDrawing
+                .replace(/<[^>]+>/g, '')
+                .replace(/&nbsp;|&#160;/g, ' ')
+                .replace(/\s+/g, '')
+
+            residual = residual
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>')
+                .replace(/&quot;/g, '"')
+                .replace(/&apos;/g, "'")
+                .replace(/&amp;/g, '&')
+
+            if (!residual || residual === '/' || residual === '\\') {
+                return ''
+            }
+            return withoutDrawing
+        })
+
+        return cleaned
             .replace(/<w:drawing\b[^>]*>[\s\S]*?<\/w:drawing>/g, '')
             .replace(/<w:pict\b[^>]*>[\s\S]*?<\/w:pict>/g, '')
     }
@@ -72,6 +102,52 @@ var DocSync = (function () {
         } catch (e) {
             return ''
         }
+    }
+
+    function _decodeXmlEntities(text) {
+        if (!text) return ''
+        return String(text)
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&quot;/g, '"')
+            .replace(/&apos;/g, "'")
+            .replace(/&amp;/g, '&')
+    }
+
+    function _xmlToPlainText(xml) {
+        if (!xml) return ''
+        return _decodeXmlEntities(
+            xml
+                .replace(/<w:tab\b[^>]*\/>/g, '\t')
+                .replace(/<w:br\b[^>]*\/>/g, '\n')
+                .replace(/<w:cr\b[^>]*\/>/g, '\n')
+                .replace(/<\/w:p>/g, '\n')
+                .replace(/<[^>]+>/g, '')
+        )
+            .replace(/\r/g, '')
+            .replace(/\n{3,}/g, '\n\n')
+            .replace(/^\n+|\n+$/g, '')
+    }
+
+    function _getSyncText() {
+        var xml = _getContent()
+        if (xml) return _xmlToPlainText(_stripDrawings(xml))
+        return _getText()
+    }
+
+    function _refreshSyncBaseline() {
+        _lastPlainText = _getSyncText()
+        _lastHash = _hash(_lastPlainText)
+    }
+
+    function _suppressContentSync(ms) {
+        var duration = Number(ms || 0)
+        if (!isFinite(duration) || duration < 0) duration = 0
+        var until = Date.now() + duration
+        if (until > _ignoreContentChangesUntil) {
+            _ignoreContentChangesUntil = until
+        }
+        _refreshSyncBaseline()
     }
 
     // ── 获取光标（Selection）所在字符位置 ─────────────────────
@@ -335,6 +411,471 @@ var DocSync = (function () {
         }
     }
 
+    function _normalizeImageMetric(value) {
+        var num = Number(value || 0)
+        if (!isFinite(num) || num < 0) return 0
+        return Math.round(num)
+    }
+
+    function _cloneImageRecord(image) {
+        if (!image) return null
+        return {
+            file_id:    String(image.file_id || ''),
+            url:        String(image.url || ''),
+            filename:   String(image.filename || ''),
+            position:   _normalizeImageMetric(image.position),
+            img_width:  _normalizeImageMetric(image.img_width),
+            img_height: _normalizeImageMetric(image.img_height),
+            deleted:    !!image.deleted,
+        }
+    }
+
+    function _imageStateKey(image) {
+        if (!image || !image.file_id) return ''
+        return [
+            _normalizeImageMetric(image.position),
+            _normalizeImageMetric(image.img_width),
+            _normalizeImageMetric(image.img_height),
+        ].join('_')
+    }
+
+    function _markImageStateSynced(image) {
+        if (!image || !image.file_id) return
+        _lastSentImageState[image.file_id] = _imageStateKey(image)
+    }
+
+    function _findImageIndex(fileId) {
+        for (var i = 0; i < _imageRegistry.length; i++) {
+            if (_imageRegistry[i].file_id === fileId) return i
+        }
+        return -1
+    }
+
+    function _getImageRecord(fileId) {
+        var idx = _findImageIndex(fileId)
+        return idx >= 0 ? _imageRegistry[idx] : null
+    }
+
+    function _upsertImageRecord(image) {
+        var record = _cloneImageRecord(image)
+        if (!record || !record.file_id) return null
+        var idx = _findImageIndex(record.file_id)
+        if (idx >= 0) {
+            var prev = _imageRegistry[idx]
+            _imageRegistry[idx] = {
+                file_id:    record.file_id,
+                url:        record.url || prev.url,
+                filename:   record.filename || prev.filename || '',
+                position:   record.position,
+                img_width:  record.img_width || prev.img_width,
+                img_height: record.img_height || prev.img_height,
+                deleted:    record.deleted,
+            }
+        } else {
+            _imageRegistry.push(record)
+        }
+        _imageMissCounts[record.file_id] = 0
+        return _getImageRecord(record.file_id)
+    }
+
+    function _listActiveImages() {
+        var list = []
+        for (var i = 0; i < _imageRegistry.length; i++) {
+            if (!_imageRegistry[i].deleted) list.push(_imageRegistry[i])
+        }
+        list.sort(function (a, b) {
+            if (a.position !== b.position) return a.position - b.position
+            return String(a.file_id).localeCompare(String(b.file_id))
+        })
+        return list
+    }
+
+    function _shiftImagePositionByEdit(image, edit) {
+        if (!image || image.deleted || !edit) return
+        var pos = _normalizeImageMetric(image.position)
+        var editPos = _normalizeImageMetric(edit.pos)
+        var delCount = _normalizeImageMetric(edit.delCount)
+        var insCount = _normalizeImageMetric(edit.insCount)
+        var editEnd = editPos + delCount
+        var delta = insCount - delCount
+
+        if (pos >= editEnd) {
+            pos += delta
+        } else if (pos > editPos) {
+            pos = editPos + insCount
+        }
+
+        if (pos < 0) pos = 0
+        image.position = pos
+    }
+
+    function _shiftImageRegistryByTextDiff(oldText, newText) {
+        var edit = _computeSingleEdit(oldText, newText)
+        if (!edit) return
+        for (var i = 0; i < _imageRegistry.length; i++) {
+            _shiftImagePositionByEdit(_imageRegistry[i], edit)
+        }
+    }
+
+    function _getInlineShapesInfo() {
+        try {
+            var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
+            if (!doc || !doc.InlineShapes) return []
+            var shapes = doc.InlineShapes
+            var list = []
+            for (var i = 1; i <= shapes.Count; i++) {
+                try {
+                    var shape = shapes.Item(i)
+                    list.push({
+                        index:    i,
+                        shape:    shape,
+                        position: _normalizeImageMetric(shape.Range ? shape.Range.Start : i),
+                        width:    _normalizeImageMetric(shape.Width),
+                        height:   _normalizeImageMetric(shape.Height),
+                    })
+                } catch (e) {}
+            }
+            list.sort(function (a, b) {
+                if (a.position !== b.position) return a.position - b.position
+                return a.index - b.index
+            })
+            return list
+        } catch (e) {
+            return []
+        }
+    }
+
+    function _detectRuntimeOS() {
+        try {
+            var doc = _boundDoc || (window.Application && window.Application.ActiveDocument)
+            var fullName = doc && doc.FullName ? String(doc.FullName) : ''
+            if (/^[A-Za-z]:\\/.test(fullName)) return 'windows'
+            if (fullName.indexOf('/') === 0) return 'mac'
+        } catch (e) {}
+
+        try {
+            var platform = (window.navigator && (window.navigator.platform || window.navigator.userAgent) || '').toLowerCase()
+            if (platform.indexOf('win') >= 0) return 'windows'
+            if (platform.indexOf('mac') >= 0 || platform.indexOf('darwin') >= 0) return 'mac'
+        } catch (e2) {}
+
+        return 'mac'
+    }
+
+    function _escapePosixArg(value) {
+        return "'" + String(value || '').replace(/'/g, "'\\''") + "'"
+    }
+
+    function _escapePowerShellArg(value) {
+        return "'" + String(value || '').replace(/'/g, "''") + "'"
+    }
+
+    function _resolveImageUrl(image) {
+        if (!image) return ''
+        var rawUrl = String(image.url || '')
+        if (!rawUrl) return ''
+        return rawUrl.indexOf('http') === 0 ? rawUrl : COLLAB_CONFIG.SERVER_HTTP + rawUrl
+    }
+
+    function _getImageExtension(image) {
+        var filename = image && image.filename ? String(image.filename) : ''
+        var match = filename.match(/\.[A-Za-z0-9]+$/)
+        if (match) return match[0].toLowerCase()
+
+        var url = _resolveImageUrl(image)
+        try {
+            var clean = url.split('?')[0]
+            var extMatch = clean.match(/\.[A-Za-z0-9]+$/)
+            if (extMatch) return extMatch[0].toLowerCase()
+        } catch (e) {}
+        return '.img'
+    }
+
+    function _getCachePaths(image) {
+        var fileId = image && image.file_id ? String(image.file_id) : ('img_' + Date.now())
+        var ext = _getImageExtension(image)
+        var osType = _detectRuntimeOS()
+        if (osType === 'windows') {
+            var winDir = '%TEMP%\\wpsAI\\images'
+            return {
+                os: osType,
+                dirForShell: winDir,
+                fileForShell: winDir + '\\' + fileId + ext,
+                localPath: winDir.replace(/^%TEMP%/, '') ? null : null,
+            }
+        }
+        var posixDir = '/tmp/wpsAI/images'
+        return {
+            os: osType,
+            dirForShell: posixDir,
+            fileForShell: posixDir + '/' + fileId + ext,
+            localPath: posixDir + '/' + fileId + ext,
+        }
+    }
+
+    function _filePathToUri(path) {
+        var normalized = String(path || '')
+        if (!normalized) return ''
+        if (/^[A-Za-z]:\\/.test(normalized)) {
+            return 'file:///' + normalized.replace(/\\/g, '/').replace(/^([A-Za-z]):/, '$1:')
+        }
+        if (normalized.indexOf('/') === 0) return 'file://' + normalized
+        if (normalized.indexOf('~/') === 0) return ''
+        return 'file:///' + normalized.replace(/\\/g, '/')
+    }
+
+    function _checkLocalFileReadable(path) {
+        return new Promise(function (resolve) {
+            var uri = _filePathToUri(path)
+            if (!uri) return resolve(false)
+            try {
+                var xhr = new XMLHttpRequest()
+                xhr.open('GET', uri, true)
+                xhr.responseType = 'blob'
+                xhr.onload = function () {
+                    resolve(xhr.status === 200 || xhr.status === 0)
+                }
+                xhr.onerror = function () { resolve(false) }
+                xhr.send()
+            } catch (e) {
+                resolve(false)
+            }
+        })
+    }
+
+    function _pollLocalFile(path, timeoutMs) {
+        return new Promise(function (resolve, reject) {
+            var startedAt = Date.now()
+            function check() {
+                _checkLocalFileReadable(path).then(function (ok) {
+                    if (ok) return resolve(path)
+                    if (Date.now() - startedAt >= timeoutMs) return reject(new Error('图片下载超时'))
+                    setTimeout(check, 250)
+                })
+            }
+            check()
+        })
+    }
+
+    function _insertRemoteImageWithCache(image) {
+        if (!image) return Promise.resolve(false)
+        return Promise.resolve(
+            _insertImageAt(image.position, _resolveImageUrl(image), image.img_width, image.img_height)
+        )
+    }
+
+    function _queueImageInsert(image) {
+        if (!image) return Promise.resolve(false)
+        var fileId = String(image.file_id || '')
+        if (fileId && _imageInsertLocks[fileId]) return Promise.resolve(false)
+        if (fileId && _findShapeForImage(fileId)) return Promise.resolve(true)
+        if (fileId) _imageInsertLocks[fileId] = true
+        _pendingImageInsertions++
+        _suppressContentSync(4000)
+        return _insertRemoteImageWithCache(image)
+            .then(function (ok) {
+                _lastImageHashes = _getImageHashes()
+                _refreshSyncBaseline()
+                return !!ok
+            })
+            .catch(function (e) {
+                console.error('[Sync] 图片异步插入失败', e)
+                return false
+            })
+            .finally(function () {
+                _pendingImageInsertions = Math.max(0, _pendingImageInsertions - 1)
+                if (fileId) delete _imageInsertLocks[fileId]
+                _refreshSyncBaseline()
+            })
+    }
+
+    function _buildImageShapeMap() {
+        var records = _listActiveImages()
+        var shapes = _getInlineShapesInfo()
+        var usedShapeIndexes = {}
+        var mapping = {}
+
+        for (var i = 0; i < records.length; i++) {
+            var record = records[i]
+            var best = null
+            var bestScore = Infinity
+            for (var j = 0; j < shapes.length; j++) {
+                var shapeInfo = shapes[j]
+                if (usedShapeIndexes[shapeInfo.index]) continue
+                var posDiff = Math.abs(shapeInfo.position - _normalizeImageMetric(record.position))
+                var widthDiff = Math.abs(shapeInfo.width - _normalizeImageMetric(record.img_width))
+                var heightDiff = Math.abs(shapeInfo.height - _normalizeImageMetric(record.img_height))
+                var score = posDiff * 10 + widthDiff + heightDiff
+                if (score < bestScore) {
+                    bestScore = score
+                    best = shapeInfo
+                }
+            }
+            if (best) {
+                usedShapeIndexes[best.index] = true
+                mapping[record.file_id] = best
+            }
+        }
+
+        return mapping
+    }
+
+    function _findShapeForImage(fileId) {
+        var mapping = _buildImageShapeMap()
+        return mapping[fileId] || null
+    }
+
+    function _removeShape(shape) {
+        if (!shape) return false
+        try {
+            shape.Delete()
+            return true
+        } catch (e) {
+            console.warn('[Sync] 删除图片失败', e)
+            return false
+        }
+    }
+
+    function _applyImageUpdateLocally(image) {
+        if (!image || !image.file_id) return false
+        var record = _upsertImageRecord(image)
+        if (!record || record.deleted) return false
+
+        _suppressContentSync(1500)
+
+        isApplying = true
+        try {
+            var shapeInfo = _findShapeForImage(record.file_id)
+            var needReinsert = !shapeInfo || shapeInfo.position !== record.position
+
+            if (!needReinsert && shapeInfo && shapeInfo.shape) {
+                try {
+                    if (record.img_width > 0) shapeInfo.shape.Width = record.img_width
+                    if (record.img_height > 0) shapeInfo.shape.Height = record.img_height
+                } catch (e) {
+                    needReinsert = true
+                }
+            }
+
+            if (needReinsert) {
+                if (shapeInfo && shapeInfo.shape) {
+                    _removeShape(shapeInfo.shape)
+                }
+                _queueImageInsert(record)
+            }
+
+            _lastImageHashes = _getImageHashes()
+            _markImageStateSynced(record)
+            _refreshSyncBaseline()
+            return true
+        } finally {
+            isApplying = false
+        }
+    }
+
+    function _deleteImageLocally(fileId) {
+        var record = _getImageRecord(fileId)
+        if (!record || record.deleted) return false
+        record.deleted = true
+        var shapeInfo = _findShapeForImage(fileId)
+        delete _lastSentImageState[fileId]
+
+        _suppressContentSync(1500)
+
+        isApplying = true
+        try {
+            if (shapeInfo && shapeInfo.shape) {
+                _removeShape(shapeInfo.shape)
+            }
+            _lastImageHashes = _getImageHashes()
+            _refreshSyncBaseline()
+            return true
+        } finally {
+            isApplying = false
+        }
+    }
+
+    function _sendImageOp(op, image) {
+        if (!image || !image.file_id || !WSManager.connected()) return false
+        if (op === 'update') {
+            _markImageStateSynced(image)
+        }
+        return WSManager.send({
+            type: 'image_op',
+            op: op,
+            image: {
+                file_id:    image.file_id,
+                url:        image.url || '',
+                filename:   image.filename || '',
+                position:   _normalizeImageMetric(image.position),
+                img_width:  _normalizeImageMetric(image.img_width),
+                img_height: _normalizeImageMetric(image.img_height),
+            },
+        })
+    }
+
+    function _findSelectedShapeInfo() {
+        try {
+            var sel = window.Application && window.Application.Selection
+            if (!sel || !sel.Range) return null
+            var inlineShapes = sel.Range.InlineShapes
+            if (inlineShapes && inlineShapes.Count > 0) {
+                var shape = inlineShapes.Item(1)
+                return {
+                    shape:    shape,
+                    index:    0,
+                    position: _normalizeImageMetric(shape.Range ? shape.Range.Start : sel.Range.Start),
+                    width:    _normalizeImageMetric(shape.Width),
+                    height:   _normalizeImageMetric(shape.Height),
+                }
+            }
+
+            var cursor = _normalizeImageMetric(sel.Range.Start)
+            var shapes = _getInlineShapesInfo()
+            var best = null
+            var bestDist = Infinity
+            for (var i = 0; i < shapes.length; i++) {
+                var dist = Math.abs(shapes[i].position - cursor)
+                if (dist < bestDist) {
+                    bestDist = dist
+                    best = shapes[i]
+                }
+            }
+            if (best && bestDist <= 2) return best
+        } catch (e) {}
+        return null
+    }
+
+    function _findImageRecordByShape(shapeInfo) {
+        if (!shapeInfo) return null
+        var records = _listActiveImages()
+        var best = null
+        var bestScore = Infinity
+        for (var i = 0; i < records.length; i++) {
+            var record = records[i]
+            var posDiff = Math.abs(_normalizeImageMetric(record.position) - shapeInfo.position)
+            var widthDiff = Math.abs(_normalizeImageMetric(record.img_width) - shapeInfo.width)
+            var heightDiff = Math.abs(_normalizeImageMetric(record.img_height) - shapeInfo.height)
+            var score = posDiff * 10 + widthDiff + heightDiff
+            if (score < bestScore) {
+                bestScore = score
+                best = record
+            }
+        }
+        return best
+    }
+
+    function _getSelectedImageContext() {
+        var shapeInfo = _findSelectedShapeInfo()
+        if (!shapeInfo) return null
+        var record = _findImageRecordByShape(shapeInfo)
+        if (!record) return null
+        return {
+            image: record,
+            shape: shapeInfo,
+        }
+    }
+
     // ── 获取当前文档 InlineShapes 哈希列表（图片检测用）────────
     // 使用图片宽度+高度+段落索引做简单指纹，WPS 无法直接读取图片字节
     function _getImageHashes() {
@@ -380,24 +921,65 @@ var DocSync = (function () {
     // 注意：WPS JSA 无法直接读取 InlineShape 的原始字节流。
     // 实际工作流：用户先在 WPS 本地插入图片 → 插件通过"插入图片"按钮
     // 弹出文件选择对话框获取本地路径 → 读取文件 → 上传。
-    // 不能自动检测本地插入（WPS JSA 限制），改为按钮触发上传。
+    // 不能自动读取任意新图片字节，但可检测已同步图片的删除/移动/缩放。
     function _checkImages() {
-        var current = _getImageHashes()
-        if (current.length === _lastImageHashes.length) return
-        _lastImageHashes = current
-        // 图片数量变化说明有本地操作（删除或插入），仅作日志
-        console.log('[Sync] 本地图片数量变化，当前:', current.length)
+        _lastImageHashes = _getImageHashes()
+        if (isApplying || _pendingImageInsertions > 0) return
+
+        var mapping = _buildImageShapeMap()
+        var active = _listActiveImages()
+        for (var i = 0; i < active.length; i++) {
+            var image = active[i]
+            var shapeInfo = mapping[image.file_id]
+            if (!shapeInfo) {
+                _imageMissCounts[image.file_id] = (_imageMissCounts[image.file_id] || 0) + 1
+                // 连续多轮都找不到才判定为删除，避免 XML 覆盖/重绘期间误报。
+                if (_imageMissCounts[image.file_id] < 3) continue
+
+                image.deleted = true
+                delete _lastSentImageState[image.file_id]
+                _sendImageOp('delete', image)
+                continue
+            }
+
+            _imageMissCounts[image.file_id] = 0
+
+            var nextPosition = _normalizeImageMetric(shapeInfo.position)
+            var nextWidth = _normalizeImageMetric(shapeInfo.width)
+            var nextHeight = _normalizeImageMetric(shapeInfo.height)
+            var changed = nextPosition !== image.position
+                || nextWidth !== image.img_width
+                || nextHeight !== image.img_height
+
+            if (!changed) continue
+
+            var nextState = nextPosition + '_' + nextWidth + '_' + nextHeight
+            if (_lastSentImageState[image.file_id] === nextState) continue
+
+            image.position = nextPosition
+            image.img_width = nextWidth
+            image.img_height = nextHeight
+            _sendImageOp('update', image)
+        }
     }
 
     // ── 轮询：检测文字变化并同步（含格式，剥离图片）──────────
     // 用 Content.Text 做变更检测（可靠），用 Content.XML 做载荷（含格式）
     // 若 Content.XML 不可用则直接发纯文本，确保在所有 WPS 版本下都能同步
     function _checkAndSync() {
-        if (isApplying || _pendingAck) return
-        var text = _getText()
+        if (isApplying || _pendingAck || _pendingImageInsertions > 0) return
+        _checkImages()
+        var text = _getSyncText()
+        if (Date.now() < _ignoreContentChangesUntil) {
+            _lastPlainText = text
+            _lastHash = _hash(text)
+            _lastContent = text
+            return
+        }
         var h    = _hash(text)
         if (h !== _lastHash) {
             _shiftFormatOpsByTextDiff(_lastPlainText, text)
+            _shiftImageRegistryByTextDiff(_lastPlainText, text)
             _lastPlainText = text
             _lastHash    = h
             _lastContent = text
@@ -440,8 +1022,9 @@ var DocSync = (function () {
                 usedPlainFallback = true
             }
             // 用实际读回的文本更新哈希，保证后续轮询基准一致
-            textAfter = _getText()
+            textAfter = _getSyncText()
             _shiftFormatOpsByTextDiff(_lastPlainText, textAfter)
+            _shiftImageRegistryByTextDiff(_lastPlainText, textAfter)
             _lastPlainText = textAfter
             _lastHash    = _hash(textAfter)
             _lastContent = content
@@ -458,10 +1041,10 @@ var DocSync = (function () {
         }
 
         // XML 覆盖文档后重新插入本地已知图片
-        if (_imageRegistry.length) {
+        if (_listActiveImages().length) {
             _reapplyImages()
             // 图片插入会改变文档，需重新同步哈希基准
-            _lastHash = _hash(_getText())
+            _lastHash = _hash(_getSyncText())
         }
     }
 
@@ -489,7 +1072,7 @@ var DocSync = (function () {
                 }
             }
             _lastContent = content
-            _lastPlainText = _getText()
+            _lastPlainText = _getSyncText()
             _lastHash    = _hash(_lastPlainText)  // 始终基于实际文本哈希
             console.log('[Sync] 已从服务器初始化文档，长度:', content.length)
         } catch (e) {
@@ -502,18 +1085,9 @@ var DocSync = (function () {
 
     // ── 重新插入注册表中所有已知图片（XML 同步覆盖文档后恢复）────
     function _reapplyImages() {
-        isApplying = true
-        try {
-            for (var i = 0; i < _imageRegistry.length; i++) {
-                var img     = _imageRegistry[i]
-                var fullUrl = img.url.indexOf('http') === 0
-                    ? img.url
-                    : COLLAB_CONFIG.SERVER_HTTP + img.url
-                _insertImageAt(img.position, fullUrl, img.img_width, img.img_height)
-            }
-            _lastImageHashes = _getImageHashes()
-        } finally {
-            isApplying = false
+        var images = _listActiveImages()
+        for (var i = 0; i < images.length; i++) {
+            _queueImageInsert(images[i])
         }
     }
 
@@ -524,17 +1098,18 @@ var DocSync = (function () {
             var img = images[i]
             if (_syncedImageIds[img.file_id]) continue
             _syncedImageIds[img.file_id] = true
-            _imageRegistry.push({
+            _upsertImageRecord({
                 file_id:    img.file_id,
                 url:        img.url,
+                filename:   img.filename,
                 position:   img.position,
                 img_width:  img.img_width,
                 img_height: img.img_height,
+                deleted:    !!img.deleted,
             })
-            var fullUrl = COLLAB_CONFIG.SERVER_HTTP + img.url
-            _insertImageAt(img.position, fullUrl, img.img_width, img.img_height)
+            if (img.deleted) continue
+            _queueImageInsert(img)
         }
-        _lastImageHashes = _getImageHashes()
     }
 
     // ── 接收远程图片插入 ──────────────────────────────────────
@@ -542,22 +1117,18 @@ var DocSync = (function () {
         if (!msg || !msg.file_id) return
         if (_syncedImageIds[msg.file_id]) return
         _syncedImageIds[msg.file_id] = true
-        _imageRegistry.push({
+        _upsertImageRecord({
             file_id:    msg.file_id,
             url:        msg.url,
+            filename:   msg.filename,
             position:   msg.position,
             img_width:  msg.img_width,
             img_height: msg.img_height,
+            deleted:    false,
         })
-        isApplying = true
-        try {
-            var fullUrl = COLLAB_CONFIG.SERVER_HTTP + msg.url
-            _insertImageAt(msg.position, fullUrl, msg.img_width, msg.img_height)
-            _lastImageHashes = _getImageHashes()
-            console.log('[Sync] 远程图片已插入:', msg.file_id)
-        } finally {
-            isApplying = false
-        }
+        _queueImageInsert(msg).then(function (ok) {
+            if (ok) console.log('[Sync] 远程图片已插入:', msg.file_id)
+        })
     }
 
     // ── 上传本地图片（由"插入图片"按钮主动触发）────────────────
@@ -627,7 +1198,7 @@ var DocSync = (function () {
     function start(docObj) {
         _pendingAck      = false   // 重置：防止重连时旧 ack 未到导致永久卡死
         _boundDoc        = docObj || (window.Application && window.Application.ActiveDocument) || null
-        _lastPlainText   = _getText()
+        _lastPlainText   = _getSyncText()
         _lastHash        = _hash(_lastPlainText)  // 始终基于文本哈希，与 XML 是否可用无关
         _lastContent     = _lastPlainText
         _lastImageHashes = _getImageHashes()
@@ -651,6 +1222,9 @@ var DocSync = (function () {
         _boundDoc        = null
         _syncedImageIds  = {}
         _imageRegistry   = []
+        _imageMissCounts = {}
+        _imageInsertLocks = {}
+        _lastSentImageState = {}
         _lastImageHashes = []
         _formatOpsHistory = []
         console.log('[Sync] 文档同步已停止')
@@ -669,18 +1243,89 @@ var DocSync = (function () {
         uploadLocalImage:    uploadLocalImage,
         pushInitialContent:  pushInitialContent,
         isRunning:           isRunning,
-        getLocalText:        _getText,
+        getLocalText:        _getSyncText,
         contentAck:          function () {
             // 服务器确认 content_update 已处理，清除发送锁，立即检测累积变更
             _pendingAck = false
             _checkAndSync()
         },
-        addLocalImage:       function (fileId, url, position, w, h) {
+        addLocalImage:       function (fileId, url, position, w, h, filename) {
             // 上传者调用：注册本地图片，防止收到服务器广播时重复插入
             if (_syncedImageIds[fileId]) return
             _syncedImageIds[fileId] = true
-            _imageRegistry.push({ file_id: fileId, url: url, position: position, img_width: w, img_height: h })
-            _lastImageHashes = _getImageHashes()
+            var record = _upsertImageRecord({
+                file_id: fileId,
+                url: url,
+                filename: filename || '',
+                position: position,
+                img_width: w,
+                img_height: h,
+                deleted: false,
+            })
+            if (record) {
+                _markImageStateSynced(record)
+                _queueImageInsert(record)
+            }
+        },
+        applyRemoteImageOp: function (msg) {
+            if (!msg || !msg.op || !msg.image || !msg.image.file_id) return
+            if (msg.op === 'delete') {
+                _deleteImageLocally(msg.image.file_id)
+                return
+            }
+            if (msg.op === 'update') {
+                _applyImageUpdateLocally(msg.image)
+            }
+        },
+        getSelectedImageInfo: function () {
+            var ctx = _getSelectedImageContext()
+            if (!ctx || !ctx.image) return null
+            return {
+                file_id: ctx.image.file_id,
+                position: ctx.shape ? ctx.shape.position : ctx.image.position,
+                img_width: ctx.shape ? ctx.shape.width : ctx.image.img_width,
+                img_height: ctx.shape ? ctx.shape.height : ctx.image.img_height,
+            }
+        },
+        syncSelectedImage: function () {
+            var ctx = _getSelectedImageContext()
+            if (!ctx || !ctx.image || !ctx.shape) {
+                return { ok: false, error: '请先在文档中选中一张已协同的图片' }
+            }
+            ctx.image.position = _normalizeImageMetric(ctx.shape.position)
+            ctx.image.img_width = _normalizeImageMetric(ctx.shape.width)
+            ctx.image.img_height = _normalizeImageMetric(ctx.shape.height)
+            _sendImageOp('update', ctx.image)
+            return { ok: true, image: _cloneImageRecord(ctx.image) }
+        },
+        resizeSelectedImage: function (width, height) {
+            var ctx = _getSelectedImageContext()
+            if (!ctx || !ctx.image) {
+                return { ok: false, error: '请先在文档中选中一张已协同的图片' }
+            }
+            var nextWidth = _normalizeImageMetric(width)
+            var nextHeight = _normalizeImageMetric(height)
+            if (!nextWidth || !nextHeight) {
+                return { ok: false, error: '宽高必须为正整数' }
+            }
+            ctx.image.img_width = nextWidth
+            ctx.image.img_height = nextHeight
+            if (!_applyImageUpdateLocally(ctx.image)) {
+                return { ok: false, error: '图片尺寸更新失败' }
+            }
+            _sendImageOp('update', ctx.image)
+            return { ok: true, image: _cloneImageRecord(ctx.image) }
+        },
+        deleteSelectedImage: function () {
+            var ctx = _getSelectedImageContext()
+            if (!ctx || !ctx.image) {
+                return { ok: false, error: '请先在文档中选中一张已协同的图片' }
+            }
+            if (!_deleteImageLocally(ctx.image.file_id)) {
+                return { ok: false, error: '图片删除失败' }
+            }
+            _sendImageOp('delete', ctx.image)
+            return { ok: true, image: _cloneImageRecord(ctx.image) }
         },
         applyLocalFormat:    function (kind, value) {
             var op = _buildFormatOp(kind, value)

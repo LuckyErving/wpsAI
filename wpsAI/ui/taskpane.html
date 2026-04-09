@@ -263,6 +263,42 @@
             font-size: 12px;
             outline: none;
         }
+        .image-toolbar {
+            border: 1px solid #e8eaed;
+            border-radius: 6px;
+            padding: 10px;
+            margin-bottom: 8px;
+            background: #fff;
+        }
+        .image-meta {
+            font-size: 12px;
+            color: #5f6368;
+            background: #f8fafc;
+            border-radius: 4px;
+            padding: 8px;
+            margin-bottom: 8px;
+            line-height: 1.6;
+        }
+        .image-row {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 6px;
+        }
+        .image-row:last-child { margin-bottom: 0; }
+        .image-row input {
+            flex: 1;
+            min-width: 0;
+            padding: 7px 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 12px;
+            outline: none;
+        }
+        .image-row .btn {
+            flex: 1;
+            margin-top: 0;
+            padding: 7px 0;
+        }
     </style>
 </head>
 
@@ -443,6 +479,21 @@
         <input id="img-file-input" type="file"
                accept="image/jpeg,image/png,image/bmp,image/gif,image/webp"
                style="display:none" onchange="onImageFileSelected(this)" />
+        <div class="image-toolbar">
+            <div class="image-meta" id="img-selected-info">未选中协同图片</div>
+            <div class="image-row">
+                <button class="btn btn-secondary" onclick="refreshSelectedImageState()">读取当前图片</button>
+                <button class="btn btn-secondary" onclick="syncSelectedImageAnchor()">同步当前位置</button>
+            </div>
+            <div class="image-row">
+                <input id="img-width-input" type="number" min="1" placeholder="宽度" />
+                <input id="img-height-input" type="number" min="1" placeholder="高度" />
+            </div>
+            <div class="image-row">
+                <button class="btn btn-secondary" onclick="applySelectedImageSize()">应用尺寸</button>
+                <button class="btn btn-danger" onclick="deleteSelectedImage()">删除当前图片</button>
+            </div>
+        </div>
         <div class="error-msg" id="img-error"></div>
         <button class="btn btn-danger" onclick="leaveCollab()" style="margin-bottom:6px">
             &#10005; 停止协作
@@ -733,6 +784,12 @@ function _handleServerMsg(msg, boundDoc) {
 
         case 'insert_image':
             DocSync.applyRemoteImage(msg)
+            refreshSelectedImageState(false)
+            break
+
+        case 'image_op':
+            DocSync.applyRemoteImageOp(msg)
+            refreshSelectedImageState(false)
             break
 
         case 'format_op':
@@ -773,6 +830,13 @@ function _handleServerMsg(msg, boundDoc) {
             break
 
         case 'error':
+            if (msg.message === 'Token 已过期，请重新登录' || msg.message === '无效的 Token') {
+                setError('collab-error', msg.message)
+                setStatus('disconnected', '登录已失效，请重新登录')
+                document.getElementById('btn-join').disabled = false
+                doLogout()
+                break
+            }
             setError('collab-error', msg.message)
             setStatus('disconnected', '错误：' + msg.message)
             document.getElementById('btn-join').disabled = false
@@ -796,6 +860,70 @@ function _updateUserList(users, selfUsername) {
 // ── 图片上传 ──────────────────────────────
 function triggerImagePick() {
     document.getElementById('img-file-input').click()
+}
+
+function _renderSelectedImageInfo(imageInfo) {
+    var infoEl = document.getElementById('img-selected-info')
+    if (!infoEl) return
+    if (!imageInfo || !imageInfo.file_id) {
+        infoEl.innerHTML = '未选中协同图片'
+        return
+    }
+    infoEl.innerHTML = '图片ID：' + _esc(imageInfo.file_id)
+        + '<br>位置：' + imageInfo.position
+        + '，尺寸：' + imageInfo.img_width + ' × ' + imageInfo.img_height
+}
+
+function refreshSelectedImageState(showError) {
+    var info = DocSync.getSelectedImageInfo ? DocSync.getSelectedImageInfo() : null
+    _renderSelectedImageInfo(info)
+    if (info) {
+        document.getElementById('img-width-input').value = info.img_width || ''
+        document.getElementById('img-height-input').value = info.img_height || ''
+        if (showError !== false) setError('img-error', '')
+        return info
+    }
+    if (showError !== false) {
+        setError('img-error', '请先在文档中选中一张通过协同插件插入的图片')
+    }
+    return null
+}
+
+function syncSelectedImageAnchor() {
+    var res = DocSync.syncSelectedImage ? DocSync.syncSelectedImage() : { ok: false, error: '图片协同不可用' }
+    if (!res.ok) {
+        setError('img-error', res.error || '同步失败')
+        return
+    }
+    setError('img-error', '')
+    _renderSelectedImageInfo(res.image)
+    document.getElementById('img-width-input').value = res.image.img_width || ''
+    document.getElementById('img-height-input').value = res.image.img_height || ''
+}
+
+function applySelectedImageSize() {
+    var width = Number(document.getElementById('img-width-input').value || 0)
+    var height = Number(document.getElementById('img-height-input').value || 0)
+    var res = DocSync.resizeSelectedImage ? DocSync.resizeSelectedImage(width, height) : { ok: false, error: '图片协同不可用' }
+    if (!res.ok) {
+        setError('img-error', res.error || '尺寸更新失败')
+        return
+    }
+    setError('img-error', '')
+    _renderSelectedImageInfo(res.image)
+}
+
+function deleteSelectedImage() {
+    if (!confirm('确定要删除当前选中的协同图片吗？')) return
+    var res = DocSync.deleteSelectedImage ? DocSync.deleteSelectedImage() : { ok: false, error: '图片协同不可用' }
+    if (!res.ok) {
+        setError('img-error', res.error || '删除失败')
+        return
+    }
+    setError('img-error', '')
+    document.getElementById('img-width-input').value = ''
+    document.getElementById('img-height-input').value = ''
+    _renderSelectedImageInfo(null)
 }
 
 function applyFormatToggle(kind) {
@@ -879,20 +1007,10 @@ function onImageFileSelected(input) {
             try {
                 var res = JSON.parse(xhr.responseText)
                 if (xhr.status === 201) {
-                    // 在本地文档光标处插入图片
-                    try {
-                        var doc    = window.Application.ActiveDocument
-                        var range  = doc.Range(pos, pos)
-                        var shape  = doc.InlineShapes.AddPicture(
-                            COLLAB_CONFIG.SERVER_HTTP + res.url, false, true, range)
-                        if (res.img_width  > 0) shape.Width  = res.img_width
-                        if (res.img_height > 0) shape.Height = res.img_height
-                    } catch (ex) {
-                        console.warn('[Image] 本地插入失败，图片已上传至服务器', ex)
-                    }
-                    // 注册到 DocSync，防止收到服务器 insert_image 广播时重复插入
-                    DocSync.addLocalImage(res.file_id, res.url, pos, res.img_width, res.img_height)
+                    // 统一走 DocSync 的本地缓存插图链路，避免上传端与接收端行为不一致
+                    DocSync.addLocalImage(res.file_id, res.url, pos, res.img_width, res.img_height, res.filename || file.name)
                     setError('img-error', '')
+                    setTimeout(function () { refreshSelectedImageState(false) }, 80)
                 } else {
                     setError('img-error', res.error || '上传失败')
                 }
@@ -916,6 +1034,9 @@ function leaveCollab() {
     document.getElementById('btn-join').style.display = ''
     document.getElementById('btn-join').disabled = false
     document.getElementById('user-list').innerHTML = ''
+    document.getElementById('img-width-input').value = ''
+    document.getElementById('img-height-input').value = ''
+    _renderSelectedImageInfo(null)
 }
 
 // ── 初始化 ────────────────────────────
